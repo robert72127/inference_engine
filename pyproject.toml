@@ -1,0 +1,15 @@
+[project]
+name = "inferece-engine"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "einops>=0.8.2",
+    "fastapi>=0.136.1",
+    "pydantic>=2.13.3",
+    "pyzmq>=27.1.0",
+    "torch>=2.11.0",
+    "transformers>=5.7.0",
+    "uvicorn>=0.46.0",
+]
