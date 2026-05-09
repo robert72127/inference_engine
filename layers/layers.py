@@ -3,35 +3,35 @@ import torch
 import math
 
 class Embedding:
-    def __init__(self, weights:torch.tensor):
+    def __init__(self, weights:torch.Tensor):
         self.embedding = torch.nn.Embedding.from_pretrained(weights, freeze=True)
     
-    def __call__(self, x:torch.tensor):
+    def __call__(self, x:torch.Tensor):
         return self.embedding(x)
 
 class Linear:
-    def __init__(self, W:torch.tensor, b:torch.tensor|None = None):
-        self.w = W
-        self.b = b
+    def __init__(self, W:torch.Tensor, b:torch.Tensor|None = None):
+        self.weights = W
+        self.bias = b
 
-    def __call__(self, x:torch.tensor):
-        return torch.nn.functional.linear(x, self.w, self.b)
+    def __call__(self, x:torch.Tensor):
+        return torch.nn.functional.linear(x, self.weights, self.bias)
 
 class SwiGLUMlp:
-    def __init__(self, down_proj_weights:torch.tensor, up_proj_weights:torch.tensor, gate_proj_weights:torch.tensor):
+    def __init__(self, down_proj_weights:torch.Tensor, up_proj_weights:torch.Tensor, gate_proj_weights:torch.Tensor):
         self.down_proj = Linear(down_proj_weights)
         self.up_proj =  Linear(up_proj_weights)
         self.gate_proj = Linear(gate_proj_weights)
 
-    def __call__(self, x:torch.tensor):
+    def __call__(self, x:torch.Tensor):
         return self.down_proj(torch.nn.functional.silu(self.gate_proj(x)) * self.up_proj(x))
         
-class RmsNorm:
-    def __init__(self, gamma_weights:torch.tensor, eps=1e-6):
+class RMSNorm:
+    def __init__(self, gamma_weights:torch.Tensor, eps=1e-6):
         self.gamma = gamma_weights
         self.eps = eps
 
-    def __call__(self, x:torch.tensor):
+    def __call__(self, x:torch.Tensor):
         rms = x.pow(2).mean(dim=-1, keepdim=True)
         return self.gamma * x * torch.rsqrt(rms + self.eps)
 
@@ -45,7 +45,7 @@ class RoPe:
         self.cos = freqs.cos()    # [L, D/2]
         self.sin = freqs.sin()
 
-    def __call__(self, x:torch.tensor, position=None):
+    def __call__(self, x:torch.Tensor, position=None):
         # x: [B, H, L, D]
         B, H, L, D = x.shape
         half = D // 2
@@ -64,8 +64,8 @@ class MultiQueryAttention:
                  k_weights, k_bias,
                  v_weights, v_bias,
                  out_proj_weights, out_proj_bias):
-        q_out_shape = q_weights.shape
-        kv_out_shape = k_weights.shape
+        q_out_shape, _ = q_weights.shape
+        kv_out_shape, _ = k_weights.shape
         self.num_kv_heads = num_kv_heads
         self.num_attn_heads= num_attn_heads
         self.rope = rope
@@ -79,7 +79,7 @@ class MultiQueryAttention:
         self.k_bias = None if k_bias is None else k_bias
         self.v_bias = None if v_bias is None else v_bias
         
-    def __call__(self, x:torch.tensor):
+    def __call__(self, x:torch.Tensor):
         Q = self.q_weights(x)
         K = self.k_weights(x)
         V = self.v_weights(x)
@@ -117,7 +117,7 @@ class TransformerBlock:
         self.attention = attention
         self.post_norm = post_norm
     
-    def __call__(self, x:torch.tensor):
+    def __call__(self, x:torch.Tensor):
         attn_in = self.pre_norm(x)
         x = x + self.attention(attn_in, input.indexes, input.op)
         mlp_in = self.post_norm(x)

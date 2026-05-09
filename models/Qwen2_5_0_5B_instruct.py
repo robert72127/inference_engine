@@ -4,20 +4,20 @@ from safetensors.torch import load_file
 import json
 from pathlib import Path
 import os
+import sys
 
-from model import Model
-'''
+from models.model import Model
 from layers.layers import (
     Embedding,
     RMSNorm,
-    MLP,
+    SwiGLUMlp,
     MultiQueryAttention,
     RoPe,
-    AsModelInput,
     Linear,
     TransformerBlock,
 )
-'''
+
+
 import torch
 
 from transformers import AutoTokenizer, AutoModelForCausalLM
@@ -47,7 +47,7 @@ def print_model():
         print(name, arr.shape, arr.dtype)
 
 #print_model()
-'''
+
 class ModelConfig:
     def __init__(self, cfg):
         self.dtype = None
@@ -79,7 +79,7 @@ def parse_mlp(mlp_tensors):
             case "up_proj": up_weights = arr
             case "_": raise Exception("unknown layer, aborting")
 
-    return MLP(down_weights=down_weights, gate_weights=gate_weights, up_weights=up_weights)
+    return SwiGLUMlp(down_proj_weights=down_weights, gate_proj_weights=gate_weights, up_proj_weights=up_weights)
 
 def parse_attn(attn_tensors, num_kv_heads, num_attn_heads, max_seq_len, rope_theta):
     k_proj_bias = k_proj_weight = None
@@ -143,9 +143,9 @@ def parse_model(model_dir:Path, cfg:ModelConfig):
         match name:
             case "embed_tokens":
                 model += [Embedding(arr)]
-                output_embed = AsModelInput(Linear(arr))
+                output_embed = Linear(arr)
             case "norm" :
-                output_norm = AsModelInput(RMSNorm(arr, cfg.rms_eps))
+                output_norm = RMSNorm(arr, cfg.rms_eps)
             case "layers": # add to layers
                 pos = int(rest[0])
                 layer = rest[1]
@@ -168,13 +168,13 @@ def parse_model(model_dir:Path, cfg:ModelConfig):
                     mlp = parse_mlp(layer[sub_layer])
                 case "self_attn":
                     self_attn = parse_attn(layer[sub_layer], cfg.n_kv_heads, cfg.n_attn_heads, cfg.max_seq_len, cfg.rope_theta)
-                    KV_caches.append(self_attn.KV_CACHE)
+                    #KV_caches.append(self_attn.KV_CACHE)
                 case _: raise Exception("Unknown layer, aborting")
         model += [TransformerBlock(mlp, input_layernorm, self_attn, post_attention_layernorm)] 
 
     model += [output_norm, output_embed]
 
-    return model, KV_caches
+    return model #, KV_caches
 
 class QwenModel2505(Model):
     def __init__(self):
@@ -185,7 +185,7 @@ class QwenModel2505(Model):
 
         model_cfg = ModelConfig(cfg)
         
-        self.layers, self.kv_caches = parse_model(model_file, model_cfg)
+        self.layers = parse_model(model_file, model_cfg)
         self.tokenizer = AutoTokenizer.from_pretrained(
             model_dir,
             local_files_only=True,
@@ -198,7 +198,6 @@ class QwenModel2505(Model):
             out = layer(out)
         return out
 
-'''
-
 if __name__ == '__main__':
+    model = QwenModel2505()
     print_model()
