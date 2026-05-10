@@ -3,10 +3,10 @@ import torch
 
 from utils.remote import subprocess_worker
 
-@subprocess_worker()
+@subprocess_worker
 class Tokenizer:
     def __init__(self, model_dir: str):
-        tokenizer = AutoTokenizer.from_pretrained(
+        self.tokenizer = AutoTokenizer.from_pretrained(
             model_dir,
             local_files_only=True,
             trust_remote_code=False,

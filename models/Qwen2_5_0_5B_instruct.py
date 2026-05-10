@@ -142,7 +142,7 @@ def parse_model(model_dir:Path, cfg:ModelConfig):
 
         match name:
             case "embed_tokens":
-                model += [Embedding(arr)]
+                model += [(Embedding(arr), False)]
                 output_embed = Linear(arr)
             case "norm" :
                 output_norm = RMSNorm(arr, cfg.rms_eps)
@@ -170,14 +170,14 @@ def parse_model(model_dir:Path, cfg:ModelConfig):
                     self_attn = parse_attn(layer[sub_layer], cfg.n_kv_heads, cfg.n_attn_heads, cfg.max_seq_len, cfg.rope_theta)
                     #KV_caches.append(self_attn.KV_CACHE)
                 case _: raise Exception("Unknown layer, aborting")
-        model += [TransformerBlock(mlp, input_layernorm, self_attn, post_attention_layernorm)] 
+        model += [(TransformerBlock(mlp, input_layernorm, self_attn, post_attention_layernorm), True)] 
 
-    model += [output_norm, output_embed]
+    model += [(output_norm, False), ( output_embed, False)]
 
 
     return model #, KV_caches
 
-class QwenModel2505(Model):
+class Qwen2_5_0_5B_Instruct(Model):
     model_dir = model_dir
     
     def __init__(self, backend):
@@ -188,11 +188,13 @@ class QwenModel2505(Model):
         self.model_dir = model_dir 
         self.layers = parse_model(model_file, model_cfg)
   
-    def __call__(self, input, bool prefi):
+    def __call__(self, input, prefill=False):
         out = input
-        for layer in self.layers: out = layer(out)
+        for layer in self.layers: 
+            layer, is_transformer = layer
+            out = layer(out, prefill=prefill) if is_transformer else layer(out)
         return out
 
 if __name__ == '__main__':
-    model = QwenModel2505()
+    model = Qwen2_5_0_5B_Instruct()
     print_model()

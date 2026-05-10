@@ -78,8 +78,8 @@ class MultiQueryAttention:
         self.q_bias = None if q_bias is None else q_bias
         self.k_bias = None if k_bias is None else k_bias
         self.v_bias = None if v_bias is None else v_bias
-        
-    def __call__(self, x:torch.Tensor):
+
+    def __call__(self, x:torch.Tensor, prefill=False):
         Q = self.q_weights(x)
         K = self.k_weights(x)
         V = self.v_weights(x)
@@ -117,8 +117,8 @@ class TransformerBlock:
         self.attention = attention
         self.post_norm = post_norm
     
-    def __call__(self, x:torch.Tensor):
+    def __call__(self, x:torch.Tensor, prefill=False):
         attn_in = self.pre_norm(x)
-        x = x + self.attention(attn_in, input.indexes, input.op)
+        x = x + self.attention(attn_in, prefill) # input.indexes, input.op)
         mlp_in = self.post_norm(x)
         return  x + self.mlp(mlp_in)
