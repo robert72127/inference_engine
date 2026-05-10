@@ -1,12 +1,16 @@
 from transformers import AutoTokenizer
 import torch
 
-from remote import subprocess_worker
+from utils.remote import subprocess_worker
 
 @subprocess_worker()
 class Tokenizer:
-    def __init__(self, model: str):
-        self.tokenizer = AutoTokenizer.from_pretrained(model)
+    def __init__(self, model_dir: str):
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_dir,
+            local_files_only=True,
+            trust_remote_code=False,
+        )
 
     def tokenize(self, texts: list[str]):
         return self.tokenizer(

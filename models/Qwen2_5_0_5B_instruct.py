@@ -25,6 +25,9 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 repo_id = "Qwen/Qwen2.5-0.5B-Instruct"
 model_dir = Path(snapshot_download(repo_id=repo_id))  # user-agnostic
 
+def get_model_dir():
+    return model_dir
+
 config = model_dir / "config.json"
 model_file = model_dir / "model.safetensors"
 
@@ -38,11 +41,8 @@ with open(config, "r") as f:
 print(cfg)
 
 def print_model():
-
     model = model_dir / "model.safetensors"
-
     tensors = load_file(model)
-
     for name, arr in tensors.items():
         print(name, arr.shape, arr.dtype)
 
@@ -174,28 +174,23 @@ def parse_model(model_dir:Path, cfg:ModelConfig):
 
     model += [output_norm, output_embed]
 
+
     return model #, KV_caches
 
 class QwenModel2505(Model):
-    def __init__(self):
+    model_dir = model_dir
+    
+    def __init__(self, backend):
         model_file = model_dir / "model.safetensors"
         config = model_dir / "config.json"
-        with open(config, "r") as f:
-            cfg = json.load(f)
-
+        with open(config, "r") as f: cfg = json.load(f)
         model_cfg = ModelConfig(cfg)
-        
+        self.model_dir = model_dir 
         self.layers = parse_model(model_file, model_cfg)
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            model_dir,
-            local_files_only=True,
-            trust_remote_code=False,
-        )
   
-    def __call__(self, input):
+    def __call__(self, input, bool prefi):
         out = input
-        for layer in self.layers:
-            out = layer(out)
+        for layer in self.layers: out = layer(out)
         return out
 
 if __name__ == '__main__':

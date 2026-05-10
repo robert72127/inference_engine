@@ -1,49 +1,33 @@
 from enum import Enum
 from dataclasses import dataclass
-import torch
 import os
+import importlib
 
-from multiprocessing import Process
 import zmq
+import torch
 
-from logger import Logger
-from tokenizer import TokenizerHandle
-
+from utils.logger import Logger
+from tokenizer import Tokenizer
+from model_processor import ModelProcessor
+from models import MODEL, models
 
 class OP(Enum):
     PREFILL = 0
-    SINGLES_STEP = 1
-
+    GENERATE = 1
 
 class BACKEND(Enum):
-    CPU = 0
-    CUDA = 1
+    CPU = "cpu"
+    CUDA = "cuda"
 
-@dataclass
-class ModelSettings:
-    model: str
-    tokenizer: str
+    def get_device_count(self, max_workers=1):
+        match self:
+            case BACKEND.CPU: return os.cpu_count()
+            case BACKEND.CUDA: return torch.cuda.device_count()
 
-model_settings = {
-    MODEL.QWEN_2 : ModelSettings(model="qwen_2", tokenizer="tiktoken")
-}
-
-class MODEL(Enum):
-    QWEN_2 = 0
-
-class GraphWorkerHandler:
-    def __init__(self, model:str, backend:str, worker_id:int, endpoint:str):
-       self.worker_id = worker_id
-       self.endpoint = endpoint
-       self.process = None
-
-       ctx = zmq.Context()
-
-       # receive jobs
-       job_receiver = ctx 
-
-    async def process(batch:torch.Tensor, operation:OP):
-        pass
+    def is_available(self):
+        match self:
+            case BACKEND.CPU: return True
+            case BACKEND.CUDA: return torch.cuda.is_available()
 
 class Scheduler:
     def __init__(self, max_prefill, max_single_step):
@@ -61,24 +45,18 @@ class Scheduler:
 
 class Engine:
     def __init__(self, model: MODEL, backend: BACKEND, max_workers=1, max_proc_req=100):
-        # detect backend and init 
-        match backend:
-            case BACKEND.CPU:
-                self.backend = "cpu"
-                self.device_count = min(max_workers, os.cpu_count())
-            case BACKEND.CUDA:
-                if torch.cuda.is_available(): self.backend = "cuda"
-                else: raise RuntimeError("Cuda is not available")
-                self.device_count = min(max_workers, torch.cuda.device_count())
+        # detect backend and init
+        self.backend = backend if backend.is_available() else BACKEND.CPU
+        self.model_workers_cnt = self.backend.get_device_count(max_workers)
+
+        module = importlib.import_module(f"models.{models[model]['module']}")
+        model_dir = module.QwenModel2505.get_model_dir() 
+        model_constructor = getattr(module, models[model]['constructor'])
 
         self.scheduler = Scheduler(max_proc_req//2, max_proc_req//2)
 
-        self.tokenizer = model_settings[model].tokenizer
-        self.model = model_settings[model].model
+        Logger.info(f"Launching tokenizer server for model : {self.model.value}")
+        self.tokenizer =  Tokenizer(model_dir=model_dir)
 
-        Logger.info(f"Launching tokenizer server with tokenizer : {self.tokenizer}")
-        self.tokenizer =  TokenizerHandle(model=self.tokenizer)
-
-        Logger.info(f"Launching model : {self.model}, with backend : {self.backend}, num workers : {self.device_count}") 
-        self.workers = [GraphWorkerHandler(model, self.backend, id=i, endpoint="tcp://127.0.0.1:6000") for i in range(self.device_count)]
-
+        Logger.info(f"Launching model : {self.model.value}, with backend : {self.backend.value}, num workers : {self.model_workers_cnt}") 
+        self.workers = [ModelProcessor(model_constructor, self.backend, id=i, endpoint="tcp://127.0.0.1:6000") for i in range(self.model_workers_cnt)]
