@@ -49,6 +49,10 @@ class ModelProcessor:
 
         self.job_count = 0
 
+    def _has_place(self): return self.job_count < self.max_jobs
+    def _add_jobs(self, cnt): self.job_count += cnt
+    def _remove_jobs(self, cnt): self.job_count -= cnt
+    
     def _take_batch_handle(self):
         if self.next_op == OP.GENERATE:
             max_batch_size = self.max_batch_generate
@@ -61,10 +65,6 @@ class ModelProcessor:
             batch.append(q.pop())
             self._add_jobs(1)
         return batch
-
-    def _has_place(self): return self.job_count < self.max_jobs
-    def _add_jobs(self, cnt): self.job_count += cnt
-    def _remove_jobs(self, cnt): self.job_count -= cnt
 
     def _make_batch(self, batch_handle:list[Handle]):
         uuid = [handle.uuid for handle in batch_handle]

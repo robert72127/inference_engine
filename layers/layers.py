@@ -64,6 +64,7 @@ class MultiQueryAttention:
                  k_weights, k_bias,
                  v_weights, v_bias,
                  out_proj_weights, out_proj_bias):
+        self.KV_cache = STUBKVCache()
         q_out_shape, _ = q_weights.shape
         kv_out_shape, _ = k_weights.shape
         self.num_kv_heads = num_kv_heads
@@ -81,12 +82,10 @@ class MultiQueryAttention:
 
     # todo fix this to properly operate on block ie directly writing on them etc
     def __call__(self, x:torch.Tensor, prefill, mask, uuid):
-        if self.prefill: return self._prefill(x, uuid, mask)
+        if prefill: return self._prefill(x, mask, uuid)
         else: return self._generate(x, uuid)
 
-    def _prefill(self, x:torch.Tensor, uuid, keys:list[int]):
-        Q, V = KV_CACHE.prefill_init(keys,uuid)
-        x = x[:,:len(keys),:]
+    def _prefill(self, x:torch.Tensor, mask, uuid):
         Q = self.q_weights(x)
         K = self.k_weights(x)
         V = self.v_weights(x)
@@ -94,7 +93,7 @@ class MultiQueryAttention:
         K = K + self.k_bias if self.k_bias is not None else K
         V = V + self.v_bias if self.v_bias is not None else V
         # prefills cache from given K,V
-        self.KV_CACHE.prefill_finish(keys, K, V)
+        self.KV_cache.prefill(uuid, K, V)
         
         Qh = rearrange(Q, "b l (h d) -> b h l d", h=self.num_attn_heads)
         Kh = rearrange(K, "b l (h d) -> b h l d", h=self.num_kv_heads)
@@ -124,13 +123,19 @@ class MultiQueryAttention:
         )
         
         attn_scores = attn_scores.masked_fill(causal, float("-inf"))
+        if mask is not None:
+            mask = mask.to(device=attn_scores.device, dtype=torch.bool)
+            key_padding = ~mask[:, None, None, None, :]
+            attn_scores = attn_scores.masked_fill(key_padding, float("-inf"))
         attn = attn_scores.softmax(dim=-1)
 
         out_g = torch.matmul(attn, Vg)
 
         out_heads = rearrange(out_g, "b h_kv g l d -> b l (h_kv g d)")
-
-        return self.outproj(out_heads)
+        out = self.outproj(out_heads)
+        if mask is not None:
+            out = out * mask[..., None].to(out.dtype)
+        return out
 
 
     def _generate(self, x:torch.Tensor, prefill=False, uuid=None):
@@ -140,7 +145,7 @@ class MultiQueryAttention:
         Q = Q + self.q_bias if self.q_bias is not None else Q
         K = K + self.k_bias if self.k_bias is not None else K
         V = V + self.v_bias if self.v_bias is not None else V
-        K,V = self.KV_CACHE.append_and_fetch(uuid, K, V)
+        K,V = self.KV_cache.append_and_fetch(uuid, K, V)
         Qh = rearrange(Q, "b l (h d) -> b h l d", h=self.num_attn_heads)
         Kh = rearrange(K, "b l (h d) -> b h l d", h=self.num_kv_heads)
         Vh = rearrange(V, "b l (h d) -> b h l d", h=self.num_kv_heads)
@@ -171,9 +176,28 @@ class TransformerBlock:
         self.pre_norm = pre_norm
         self.attention = attention
         self.post_norm = post_norm
-    
-    def __call__(self, x:torch.Tensor, prefill, uuid, key:list[int]|int):
+
+    def __call__(self, x:torch.Tensor, prefill, mask, uuid):
         attn_in = self.pre_norm(x)
-        x = x + self.attention(attn_in, prefill, uuid, key)
+        x = x + self.attention(attn_in, prefill, mask, uuid)
         mlp_in = self.post_norm(x)
         return  x + self.mlp(mlp_in)
+    
+class STUBKVCache:
+    def __init__(self):
+        self.uuid_to_tensors = {}
+
+    def prefill(self, uuid, K, V):
+        self.uuid_to_tensors[uuid] = [K, V]
+
+    def append_and_fetch(self, uuid, K, V):
+        K_old, V_old = self.uuid_to_tensors[uuid]
+        if K.dim() == K_old.dim() - 1:
+            K = K.unsqueeze(0)
+            V = V.unsqueeze(0)
+
+        K_new = torch.cat([K_old, K], dim=0)
+        V_new = torch.cat([V_old, V], dim=0)
+
+        self.uuid_to_tensors[uuid] = [K_new, V_new]
+        return K_new, V_new
