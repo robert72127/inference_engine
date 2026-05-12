@@ -188,11 +188,11 @@ class Qwen2_5_0_5B_Instruct(Model):
         self.model_dir = model_dir 
         self.layers = parse_model(model_file, model_cfg)
   
-    def __call__(self, input, prefill=False):
+    def __call__(self, input, prefill, mask, uuid):
         out = input
         for layer in self.layers: 
             layer, is_transformer = layer
-            out = layer(out, prefill=prefill) if is_transformer else layer(out)
+            out = layer(out, prefill=prefill, mask=mask, uuid=uuid) if is_transformer else layer(out)
         return out
 
 if __name__ == '__main__':

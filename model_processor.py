@@ -2,6 +2,8 @@ import asyncio
 import threading 
 
 import torch
+from torch.nn.utils.rnn import pad_sequence
+
 from enum import Enum
 from utils.remote import subprocess_worker
 
@@ -15,8 +17,11 @@ class Handle:
     def __init__(self, uuid: int, tokens: torch.Tensor, mask: torch.Tensor):
         self.uuid = uuid
         self.tokens = tokens
-        self.mask = mask
         self.token_queue = asyncio.Queue()
+        self.input = None
+
+    def set_next_token_gen(self, tok):
+        self.input = tok
 
     async def get_next_token(self):
         tok = await self.token_queue.get()
@@ -44,15 +49,38 @@ class ModelProcessor:
 
         self.job_count = 0
 
-    def take_batch(self, q, max_batch_size):
+    def _take_batch_handle(self):
+        if self.next_op == OP.GENERATE:
+            max_batch_size = self.max_batch_generate
+            in_q = self.waiting
+        else:
+            max_batch_size = self.max_batch_prefill
+            in_q = self.prefill
         batch = []
-        while len(batch) < max_batch_size and q:
+        while len(batch) < max_batch_size and in_q and self.job_count < self.max_jobs :
             batch.append(q.pop())
+            self._add_jobs(1)
         return batch
 
-    def has_place(self): return self.job_count < self.max_jobs
-    def add_jobs(self, cnt): self.job_count += cnt
-    def remove_jobs(self, cnt): self.job_count -= cnt
+    def _has_place(self): return self.job_count < self.max_jobs
+    def _add_jobs(self, cnt): self.job_count += cnt
+    def _remove_jobs(self, cnt): self.job_count -= cnt
+
+    def _make_batch(self, batch_handle:list[Handle]):
+        uuid = [handle.uuid for handle in batch_handle]
+        if self.next_op == OP.GENERATE:
+            mask = None
+            input = torch.tensor([handle.input for handle in batch_handle])
+        else:
+            input = [handle.input for handle in batch_handle]
+            lengths = torch.tensor([t.size(0) for t in input])
+            input = pad_sequence(
+                input,
+                batch_first=True,
+                padding_value=0
+            )
+            mask = torch.arange(input.size(1))[None, :] < lengths[:, None]
+        return uuid,input, mask
 
     def worker_loop(self):
         while True:
@@ -61,38 +89,35 @@ class ModelProcessor:
                 self.cv.wait_for(
                     lambda: self.waiting or self.prefill
                 )
-
-                self.next_op = OP.PREFILL if self.waiting else OP.GENERATE
                 with self.lock:
-                    if self.next_op == OP.PREFILL:
-                        batch = self.take_batch(self.waiting, self.max_batch_prefill)
-                    else:
-                        batch = self.take_batch(self.generate, self.max_batch_generate)
+                    self.next_op = OP.PREFILL if self.waiting and self._has_place() else OP.GENERATE
+                    batch = self._take_batch_handle()
                 
-                input_batch = [handle.input for handle in batch]
-                uuid_batch = [handle.uuid for handle in batch]
-                results = self.model(input_batch, self.next_op == OP.PREFILL, uuid_batch)
+                uuid, input, mask = self._make_batch(batch)
+                results = self.model(input, self.next_op == OP.PREFILL, mask, uuid)
                 if self.next_op == OP.PREFILL:
                     for i, handle in enumerate(batch):
                         self.prefill.append(handle)
+                        handle.next_token_gen = results[i]
                         handle.token_queue.put(results[i])
                 else:
                     for handle in batch:
+                        handle.next_token_gen = results[i]
                         handle.token_queue.put(results[i])
                         if handle.eos:
                             self.generate.remove(handle)
-                            self.remove_jobs(1)
+                            self._remove_jobs(1)
                 self.next_op = OP.GENERATE if self.next_op == OP.PREFILL else OP.PREFILL
 
-    async def prefill(self, tokens: torch.Tensor, mask:torch.Tensor):
-        handle = Handle(self.next_uuid, tokens, mask)
+    async def prefill(self, tokens: torch.Tensor):
+        handle = Handle(self.next_uuid, tokens)
         uuid = 0
         with self.lock:
             uuid = self.next_uuid
             self.next_uuid += 1
-            self.waiting += (Handle(uuid, tokens, mask),)
+            self.waiting += (handle,)
         next_token = await handle.get_next_token()
-        return handle, next_token
+        return handle
 
     async def single_step(self, handle: Handle):
         next_token = await handle.get_next_token()

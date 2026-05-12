@@ -93,14 +93,48 @@ class KVCache:
         self.k_cache = torch.zeros((num_pages, page_size, d_model), device=device, dtype=dtype)
         self.v_cache = torch.zeros((num_pages, page_size, d_model), device=device, dtype=dtype)
 
-        self.free_pages = [Page(self.k_cache[i], self.v_cache[i], page_size, d_model, device, dtype) for i in range(num_pages)]
 
-    # todo
-    def append_and_fetch(self):
+        self.free_pages = [Page(self.k_cache[i], self.v_cache[i], page_size, d_model, device, dtype) for i in range(num_pages)]
+        self.page_to_key = {}
+        self.least_recently_used = []
+
+        #contains info about which pages are currently locked, for given page stores uuid's
+        self.pages_locked = [set() for _ in range(num_pages)]
+
+        # trie root
+        self.trie = None
+
+        # for given uuid store page he is currently writing to
+        self.uuid_to_write_page = {}
+
+    # writes single K,V values for user, and returns full list of pages 
+    def append_and_fetch(self,uuid, tok:int, K, V):
         pass
-    def commit_page(self):
+
+    # returns list of already present block, list of missing keys and list of block needed for them
+    def prefill_init(self, keys: list[int], uuid):
+        blocks, missing_keys = self.trie.fetch(keys)
+        # ok we know how many extra blocks are needed based on amount of missing keys
+        # and we also know which block will become 
+
+    # now essentially walk tree, for each page that is not already present write it to tree and commit,
+    # except for last page if its not full then we dont commit it and keep as write_page
+    def prefill_finish(self, keys:list[int], blocks: list[Page], uuid):
         pass
-    def evict_page(self):
+
+    # unlock locked pages for given user, evict no fully writen pages
+    def unlock(self, uuid): 
         pass
-    def get_free_page(self):
+
+
+    def _commit_page(page_index):
+        pass
+
+    def _evict_page(self):
+        pass
+
+    def _lock_page(self, page_index):
+        pass
+
+    def _get_free_page(self):
         pass

@@ -79,13 +79,68 @@ class MultiQueryAttention:
         self.k_bias = None if k_bias is None else k_bias
         self.v_bias = None if v_bias is None else v_bias
 
-    def __call__(self, x:torch.Tensor, prefill=False):
+    # todo fix this to properly operate on block ie directly writing on them etc
+    def __call__(self, x:torch.Tensor, prefill, mask, uuid):
+        if self.prefill: return self._prefill(x, uuid, mask)
+        else: return self._generate(x, uuid)
+
+    def _prefill(self, x:torch.Tensor, uuid, keys:list[int]):
+        Q, V = KV_CACHE.prefill_init(keys,uuid)
+        x = x[:,:len(keys),:]
         Q = self.q_weights(x)
         K = self.k_weights(x)
         V = self.v_weights(x)
         Q = Q + self.q_bias if self.q_bias is not None else Q
         K = K + self.k_bias if self.k_bias is not None else K
         V = V + self.v_bias if self.v_bias is not None else V
+        # prefills cache from given K,V
+        self.KV_CACHE.prefill_finish(keys, K, V)
+        
+        Qh = rearrange(Q, "b l (h d) -> b h l d", h=self.num_attn_heads)
+        Kh = rearrange(K, "b l (h d) -> b h l d", h=self.num_kv_heads)
+        Vh = rearrange(V, "b l (h d) -> b h l d", h=self.num_kv_heads)
+
+        if self.rope is not None:
+            Qh = self.rope(Qh)
+            Kh = self.rope(Kh)
+
+        B, H_q, L, D = Qh.shape
+        _, H_kv, _, _ = Kh.shape
+
+        group = H_q // H_kv   # number of query heads per kv head
+
+        Qg = Qh.view(B, H_kv, group, L, D)
+        Kg = Kh.unsqueeze(2)
+        Vg = Vh.unsqueeze(2)
+
+        attn_scores = torch.matmul(Qg, Kg.transpose(-1, -2)) / math.sqrt(D)
+        
+        B, H_kv, G, L, _ = attn_scores.shape
+
+        # [L, L] upper-triangular mask where j > i (future positions)
+        causal = torch.triu(
+            torch.ones(L, L, device=attn_scores.device, dtype=torch.bool),
+            diagonal=1,
+        )
+        
+        attn_scores = attn_scores.masked_fill(causal, float("-inf"))
+        attn = attn_scores.softmax(dim=-1)
+
+        out_g = torch.matmul(attn, Vg)
+
+        out_heads = rearrange(out_g, "b h_kv g l d -> b l (h_kv g d)")
+
+        return self.outproj(out_heads)
+
+
+    def _generate(self, x:torch.Tensor, prefill=False, uuid=None):
+        Q = self.q_weights(x)
+        K = self.k_weights(x)
+        V = self.v_weights(x)
+        Q = Q + self.q_bias if self.q_bias is not None else Q
+        K = K + self.k_bias if self.k_bias is not None else K
+        V = V + self.v_bias if self.v_bias is not None else V
+        K,V = self.KV_CACHE.append_and_fetch(uuid, K, V)
         Qh = rearrange(Q, "b l (h d) -> b h l d", h=self.num_attn_heads)
         Kh = rearrange(K, "b l (h d) -> b h l d", h=self.num_kv_heads)
         Vh = rearrange(V, "b l (h d) -> b h l d", h=self.num_kv_heads)
@@ -117,8 +172,8 @@ class TransformerBlock:
         self.attention = attention
         self.post_norm = post_norm
     
-    def __call__(self, x:torch.Tensor, prefill=False):
+    def __call__(self, x:torch.Tensor, prefill, uuid, key:list[int]|int):
         attn_in = self.pre_norm(x)
-        x = x + self.attention(attn_in, prefill) # input.indexes, input.op)
+        x = x + self.attention(attn_in, prefill, uuid, key)
         mlp_in = self.post_norm(x)
         return  x + self.mlp(mlp_in)

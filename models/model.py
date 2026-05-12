@@ -1,9 +1,12 @@
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
+
+import torch
 
 class Model(ABC):
     def __init__(self, backend:str):
         pass
-    def __call__(self, input):
+    def __call__(self, input:ModelInput):
         pass
     def get_model_dir(self):
         pass
