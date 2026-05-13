@@ -21,11 +21,12 @@ class OP(Enum):
     FINISHED = 3
 
 class ServerHandle:
-    def __init__(self, handle_id: int, tokens: torch.Tensor):
+    def __init__(self, handle_id: int, tokens: torch.Tensor, max_queue_size: int = 8):
         self.id = handle_id
         self.tokens = tokens
-        self.input = tokens
 
+        #  previous token for generation.
+        self.input_token: int | None = None
         self.token_q: queue.Queue[int] = queue.Queue()
         self.finished = False
 
@@ -90,20 +91,6 @@ class RemoteModelProcessorHandle:
             self.reader_task.cancel()
 
         self.socket.close(linger=0)
-
-
-class ServerHandle:
-    def __init__(self, handle_id: int, tokens: torch.Tensor, max_queue_size: int = 8):
-        self.id = handle_id
-        self.tokens = tokens
-
-        #  previous token for generation.
-        self.input_token: int | None = None
-
-        # produced tokens are pushed here by worker_loop.
-        self.token_q: queue.Queue[int] = queue.Queue()
-
-        self.finished = False
 
 class ModelProcessor:
     def __init__(
@@ -236,10 +223,7 @@ class ModelProcessor:
                     elif op == OP.PREFILL:
                         self.generating.append(handle)
 
-                    # This can block if client stops reading.
-                    # That is good backpressure, but if you don't want worker blocking,
-                    # use put_nowait and handle overflow.
-                    handle.token_q.put(tok)
+                    handle.token_q.put_nowait(tok)
 
                 next_op = OP.GENERATE if op == OP.PREFILL else OP.PREFILL
 
