@@ -12,6 +12,8 @@ from model_processor import ModelProcessor
 from models import MODEL, models
 from sampling import top_k_top_p_sample
 
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
+
 class BACKEND(Enum):
     CPU = "cpu"
     CUDA = "cuda"
@@ -37,6 +39,7 @@ class Engine:
         model_dir = module.get_model_dir() 
         model_constructor = getattr(module, models[model]['constructor'])
 
+        self.tokenizer_pool = ThreadPoolExecutor(max_workers=1)
         Logger.info(f"Launching tokenizer server for model : {self.model.value}")
         self.tokenizer =  Tokenizer(model_dir=model_dir)
 
@@ -63,15 +66,22 @@ class Engine:
 
     async def generate_stream(self, message, max_tokens):
         prompt = self.apply_prompt_template(message)
-        tokenized = await self.tokenizer.tokenize(prompt)
+        tokenized = await self.tokenizer.tokenize([prompt])
         tokens = tokenized["input_ids"]
 
         backend = self.schedule()
 
         handle = await self.backend.prefill(tokens)
+
+        generated = []
         for _ in range(max_tokens):
-            next_token = await self.backend.single_step(handle)
-            if next_token == self.tokenizer.eos_token_id:
+            next_token = await backend.single_step(handle)
+            if next_token == self.tokenizer.tokenizer.eos_token_id:
                 break
-            text = self.tokenizer.detokenize(next_token)
+            generated.append(next_token)
+            text = self.tokenizer.tokenizer.decode(
+                generated,
+                skip_special_tokens=True,
+            )
+
             yield text
