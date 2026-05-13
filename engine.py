@@ -1,18 +1,12 @@
 from enum import Enum
-from dataclasses import dataclass
 import os
 import importlib
-from time import sleep
-import zmq
 import torch
 
 from utils.logger import Logger
 from tokenizer import Tokenizer
 from model_processor import ModelProcessor
 from models import MODEL, models
-from sampling import top_k_top_p_sample
-
-from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 
 class BACKEND(Enum):
     CPU = "cpu"
@@ -39,19 +33,17 @@ class Engine:
         model_dir = module.get_model_dir() 
         model_constructor = getattr(module, models[model]['constructor'])
 
-        self.tokenizer_pool = ThreadPoolExecutor(max_workers=1)
         Logger.info(f"Launching tokenizer server for model : {self.model.value}")
         self.tokenizer =  Tokenizer(model_dir=model_dir)
+        eos_token_id = self.tokenizer.tokenizer.eos_token_id
 
         Logger.info(f"Launching model : {self.model.value}, with backend : {self.backend.value}, num workers : {self.model_workers_cnt}") 
-        self.workers = [ModelProcessor(model_constructor, self.backend, endpoint="tcp://127.0.0.1:6000") for i in range(self.model_workers_cnt)]
+        self.workers = [ModelProcessor(model_constructor, self.backend, eos_token_id=eos_token_id) for _ in range(self.model_workers_cnt)]
 
         self.next_worker = 0
 
-        self.pro
-
     def apply_prompt_template(self, prompt: str):
-        return f"<|im_start|>system\nYou are a helpful assistant anser .<|im_end|>\n<|im_start|>user\n{{prompt}}<|im_end|>\n<|im_start|>assistant\n"
+        return f"<|im_start|>system\nYou are a helpful assistant anser .<|im_end|>\n<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
 
     def schedule(self):
         worker = self.workers[self.next_worker]
@@ -71,17 +63,14 @@ class Engine:
 
         backend = self.schedule()
 
-        handle = await self.backend.prefill(tokens)
+        handle = await backend.prefill(tokens)
 
-        generated = []
         for _ in range(max_tokens):
-            next_token = await backend.single_step(handle)
-            if next_token == self.tokenizer.tokenizer.eos_token_id:
-                break
-            generated.append(next_token)
-            text = self.tokenizer.tokenizer.decode(
-                generated,
-                skip_special_tokens=True,
-            )
+            tok = await self.backend.next_token(handle)
 
-            yield text
+            if tok == self.tokenizer.eos_token_id:
+                break
+
+            yield self.tokenizer.detokenize([tok])
+
+        await self.backend.release(handle)
