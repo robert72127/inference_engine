@@ -59,18 +59,18 @@ class Engine:
     async def generate_stream(self, message, max_tokens):
         prompt = self.apply_prompt_template(message)
         tokenized = await self.tokenizer.tokenize([prompt])
-        tokens = tokenized["input_ids"]
+        tokens = tokenized["input_ids"][0]
 
         backend = self.schedule()
 
         handle = await backend.prefill(tokens)
 
         for _ in range(max_tokens):
-            tok = await self.backend.next_token(handle)
+            tok = await backend.next_token(handle)
 
-            if tok == self.tokenizer.eos_token_id:
+            if tok == self.tokenizer.tokenizer.eos_token_id:
                 break
 
-            yield self.tokenizer.detokenize([tok])
+            yield self.tokenizer.detokenize_sync([[tok]])[0]
 
-        await self.backend.release(handle)
+        await backend.release(handle)

@@ -1,120 +1,126 @@
-from fastapi import FastAPI
-from fastapi.responses import StreamingResponse
-
-from pydantic import BaseModel
-from typing import Literal, Optional, List
-
+import os
+import json
 import time
+import uuid
+from contextlib import asynccontextmanager
+from typing import Literal
 
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
 
-app = FastAPI()
+from engine import BACKEND, Engine
+from models import MODEL
 
-# request
 
 class ChatMessage(BaseModel):
     role: Literal["system", "user", "assistant", "developer"]
     content: str
 
+
 class ChatCompletionRequest(BaseModel):
     model: str
     messages: list[ChatMessage]
-    max_tokens: Optional[int] = 256
-    temperature: Optional[float] = 1.0
-    top_p: Optional[float] = 1.0
-    stream: Optional[bool] = False
-    stop: Optional[str | list[str]] = None
-
-# /v1/models response
-
-class ModelCard(BaseModel):
-    id: str
-    object: str = "model"
-    created: int = 0
-    owned_by: str = "local"
-
-class ModelList(BaseModel):
-    object: str = "list"
-    data: List[ModelCard]
+    max_tokens: int = 256
+    temperature: float = 1.0
+    top_p: float = 1.0
+    stream: bool = False
+    stop: str | list[str] | None = None
 
 
-# non-streaming response
+def parse_model(model_name: str) -> MODEL:
+    try:
+        return MODEL(model_name)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=f"Unknown model: {model_name}") from exc
 
-class ChatCompletionResponseMessage(BaseModel):
-    role: Literal["assistant"]
-    content: str
 
-class ChatCompletionChoice(BaseModel):
-    index: int
-    message: ChatCompletionResponseMessage
-    finish_reason: Literal["stop", "length"]
+def build_prompt(messages: list[ChatMessage]) -> str:
+    prompt = "\n".join(msg.content for msg in messages if msg.role == "user")
+    if not prompt:
+        raise HTTPException(status_code=400, detail="At least one user message is required")
+    return prompt
 
-class Usage(BaseModel):
-    prompt_tokens: int
-    completion_tokens: int
-    total_tokens: int
 
-class ChatCompletionResponse(BaseModel):
-    id: str
-    object: str = "chat.completion"
-    created: int
-    model: str
-    choices: List[ChatCompletionChoice]
-    usage: Usage
+def usage(text: str, completion: str) -> dict:
+    prompt_tokens = len(text.split())
+    completion_tokens = len(completion.split())
+    return {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": prompt_tokens + completion_tokens,
+    }
 
-# streaming response
 
-class DeltaMessage(BaseModel):
-    role: Optional[Literal["assistant"]] = None
-    content: Optional[str] = None
+def chunk_payload(completion_id: str, created: int, model: str, delta: dict, finish_reason=None) -> dict:
+    return {
+        "id": completion_id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
+    }
 
-class ChatCompletionChunkChoice(BaseModel):
-    index: int
-    delta: DeltaMessage
-    finish_reason: Optional[Literal["stop", "length"]] = None
 
-class ChatCompletionChunk(BaseModel):
-    id: str
-    object: str = "chat.completion.chunk"
-    created: int
-    model: str
-    choices: List[ChatCompletionChunkChoice]
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    model = parse_model(os.getenv("MODEL_NAME", MODEL.QWEN_2_5_0_5B_INSTRUCT.value))
+    backend = BACKEND(os.getenv("MODEL_BACKEND", BACKEND.CPU.value))
+    max_workers = int(os.getenv("MODEL_MAX_WORKERS", "1"))
+    app.state.engine = Engine(model=model, backend=backend, max_workers=max_workers)
+    yield
 
-# post, get API
+
+app = FastAPI(lifespan=lifespan)
+
 
 @app.get("/v1/models")
 async def list_models():
-    data_model = ModelCard(id="qwen-custom", object="model", created=0, owned_by="local")
-    model_list = ModelList(object="list", data = [data_model])
-    return model_list
+    return {
+        "object": "list",
+        "data": [
+            {"id": model.value, "object": "model", "created": 0, "owned_by": "local"}
+            for model in MODEL
+        ],
+    }
 
-
-async def generate_full(text:str):
-    return "text"
 
 @app.post("/v1/chat/completions")
-async def chat(req : ChatCompletionRequest):
-    #prompt = messages_to_prompt(req.messages)
-
-    if req.stream:
-        chunk_choice = ChatCompletionChunkChoice(index=0, delta=DeltaMessage())
-        chunk = ChatCompletionChunk(id=0,object="chat.completion.chunk", created=0, model="qwen", choices=[chunk_choice])        
-        return StreamingResponse(
-            chunk,
-            media_type="text/event-stream",
+async def chat(req: ChatCompletionRequest):
+    engine = app.state.engine
+    model = parse_model(req.model)
+    if model != engine.model:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Server loaded model '{engine.model.value}', requested '{req.model}'",
         )
 
-    text = await generate_full(req)
+    prompt = build_prompt(req.messages)
+    created = int(time.time())
+    completion_id = f"chatcmpl-{uuid.uuid4().hex}"
 
-    return ChatCompletionResponse(
-        id="chatcmpl-123",
-        created=int(time.time()),
-        model=req.model,
-        choices=[
-            ChatCompletionChoice(
-                index=0,
-                message={"role": "assistant", "content": text},
-                finish_reason="stop",
-            )
+    if req.stream:
+        async def event_stream():
+            yield f"data: {json.dumps(chunk_payload(completion_id, created, req.model, {'role': 'assistant'}))}\n\n"
+            async for delta in engine.generate_stream(prompt, req.max_tokens):
+                yield f"data: {json.dumps(chunk_payload(completion_id, created, req.model, {'content': delta}))}\n\n"
+            yield f"data: {json.dumps(chunk_payload(completion_id, created, req.model, {}, 'stop'))}\n\n"
+            yield "data: [DONE]\n\n"
+
+        return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+    text = await engine.generate(prompt, req.max_tokens)
+    return {
+        "id": completion_id,
+        "object": "chat.completion",
+        "created": created,
+        "model": req.model,
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": text},
+                "finish_reason": "stop",
+            }
         ],
-        usage={"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
-    )
+        "usage": usage(prompt, text),
+    }
