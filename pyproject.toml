@@ -12,6 +12,7 @@ dependencies = [
     "einops>=0.8.2",
     "fastapi>=0.136.1",
     "huggingface-hub>=0.35.0",
+    "msgpack>=1.1.2",
     "pydantic>=2.13.3",
     "pyzmq>=27.1.0",
     "safetensors>=0.6.2",

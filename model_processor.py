@@ -152,7 +152,10 @@ class ModelProcessor:
         self.worker.start()
 
     async def prefill(self, tokens: list[int]):
-        tokens_t = torch.tensor(tokens, dtype=torch.long)
+        if isinstance(tokens, torch.Tensor):
+            tokens_t = tokens.detach().clone().to(dtype=torch.long)
+        else:
+            tokens_t = torch.tensor(tokens, dtype=torch.long)
 
         with self.cv:
             handle_id = self.next_handle_id
@@ -164,7 +167,7 @@ class ModelProcessor:
 
             self.cv.notify()
 
-        return {"handle_id": handle_id,}
+        return handle_id
 
     async def next_token(self, handle_id: int):
         with self.lock:
@@ -172,7 +175,7 @@ class ModelProcessor:
 
         loop = asyncio.get_running_loop()
         tok = await loop.run_in_executor(None,handle.token_q.get,)
-        return {"token": tok,}
+        return tok
 
     async def release(self, handle_id: int):
         with self.cv:
@@ -195,7 +198,7 @@ class ModelProcessor:
             input_ids = torch.tensor(
                 [h.input_token for h in batch],
                 dtype=torch.long,
-            )
+            ).unsqueeze(1)
             return handle_ids, input_ids, None
     
     def worker_loop(self):
@@ -214,7 +217,13 @@ class ModelProcessor:
                     batch = self.generating[: self.max_batch_generate]
 
             handle_ids, input_ids, mask = self._make_batch(batch, op)
-            results = self.model(input_ids, op == OP.PREFILL, mask, handle_ids,)
+            request_key = tuple(handle_ids)
+            results = self.model(input_ids, op == OP.PREFILL, mask, request_key)
+            if op == OP.PREFILL:
+                results = results[:, -1, :].argmax(dim=-1)
+            else:
+                results = results.argmax(dim=-1)
+            results = results.tolist()
 
             with self.cv:
                 for handle, tok in zip(batch, results):

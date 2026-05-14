@@ -49,9 +49,16 @@ class RoPe:
         # x: [B, H, L, D]
         B, H, L, D = x.shape
         half = D // 2
-        if position is None: position = torch.arange(L, device=x.device)
-        cos = self.cos[position].to(x.device)[None,None,:,:]
-        sin = self.sin[position].to(x.device)[None,None,:,:]
+        if position is None:
+            position = torch.arange(L, device=x.device).unsqueeze(0).expand(B, -1)
+        else:
+            position = torch.as_tensor(position, device=x.device)
+            if position.shape != (B, L):
+                raise ValueError(f"Unsupported RoPE position shape {tuple(position.shape)} for x shape {tuple(x.shape)}")
+
+        cos = self.cos[position].to(x.device)[:, None, :, :]
+        sin = self.sin[position].to(x.device)[:, None, :, :]
+
         # upcast x for RoPE math
         x_f = x.to(torch.float32)
         x1 = x_f[..., :half]
@@ -100,8 +107,9 @@ class MultiQueryAttention:
         Vh = rearrange(V, "b l (h d) -> b h l d", h=self.num_kv_heads)
 
         if self.rope is not None:
-            Qh = self.rope(Qh)
-            Kh = self.rope(Kh)
+            positions = torch.arange(Qh.size(2), device=Qh.device).unsqueeze(0).expand(Qh.size(0), -1)
+            Qh = self.rope(Qh, position=positions)
+            Kh = self.rope(Kh, position=positions)
 
         B, H_q, L, D = Qh.shape
         _, H_kv, _, _ = Kh.shape
@@ -138,20 +146,20 @@ class MultiQueryAttention:
         return out
 
 
-    def _generate(self, x:torch.Tensor, prefill=False, uuid=None):
+    def _generate(self, x:torch.Tensor, uuid=None):
         Q = self.q_weights(x)
         K = self.k_weights(x)
         V = self.v_weights(x)
         Q = Q + self.q_bias if self.q_bias is not None else Q
         K = K + self.k_bias if self.k_bias is not None else K
         V = V + self.v_bias if self.v_bias is not None else V
-        K,V = self.KV_cache.append_and_fetch(uuid, K, V)
+        K, V, q_positions, k_positions, kv_mask = self.KV_cache.append_and_fetch(uuid, K, V)
         Qh = rearrange(Q, "b l (h d) -> b h l d", h=self.num_attn_heads)
         Kh = rearrange(K, "b l (h d) -> b h l d", h=self.num_kv_heads)
         Vh = rearrange(V, "b l (h d) -> b h l d", h=self.num_kv_heads)
         if self.rope is not None:
-            Qh = self.rope(Qh)
-            Kh = self.rope(Kh)
+            Qh = self.rope(Qh, position=q_positions)
+            Kh = self.rope(Kh, position=k_positions)
 
         B, H_q, L, D = Qh.shape
         _, H_kv, _, _ = Kh.shape
@@ -165,6 +173,10 @@ class MultiQueryAttention:
 
         causal = torch.triu(torch.ones(L, L, device=attn_scores.device, dtype=torch.bool),diagonal=1,)
         attn_scores = attn_scores.masked_fill(causal, float("-inf"))
+        if kv_mask is not None:
+            kv_mask = kv_mask.to(device=attn_scores.device, dtype=torch.bool)
+            key_padding = ~kv_mask[:, None, None, None, :]
+            attn_scores = attn_scores.masked_fill(key_padding, float("-inf"))
         attn = attn_scores.softmax(dim=-1)
         out_g = torch.matmul(attn, Vg)
         out_heads = rearrange(out_g, "b h_kv g l d -> b l (h_kv g d)")
@@ -182,22 +194,70 @@ class TransformerBlock:
         x = x + self.attention(attn_in, prefill, mask, uuid)
         mlp_in = self.post_norm(x)
         return  x + self.mlp(mlp_in)
-    
+
 class STUBKVCache:
     def __init__(self):
         self.uuid_to_tensors = {}
 
     def prefill(self, uuid, K, V):
+        if isinstance(uuid, (list, tuple)):
+            for idx, handle_id in enumerate(uuid):
+                self.uuid_to_tensors[handle_id] = [K[idx:idx + 1], V[idx:idx + 1]]
+            return
+
         self.uuid_to_tensors[uuid] = [K, V]
 
     def append_and_fetch(self, uuid, K, V):
+        if isinstance(uuid, (list, tuple)):
+            K_batches = []
+            V_batches = []
+            q_positions = []
+            lengths = []
+
+            for idx, handle_id in enumerate(uuid):
+                K_old, V_old = self.uuid_to_tensors[handle_id]
+                q_positions.append(K_old.size(1))
+                K_new = torch.cat([K_old, K[idx:idx + 1]], dim=1)
+                V_new = torch.cat([V_old, V[idx:idx + 1]], dim=1)
+                self.uuid_to_tensors[handle_id] = [K_new, V_new]
+                K_batches.append(K_new)
+                V_batches.append(V_new)
+                lengths.append(K_new.size(1))
+
+            max_len = max(lengths)
+            K_padded = []
+            V_padded = []
+            kv_mask = []
+            k_positions = []
+
+            for K_new, V_new, length in zip(K_batches, V_batches, lengths):
+                pad_len = max_len - length
+                if pad_len:
+                    K_new = torch.nn.functional.pad(K_new, (0, 0, 0, pad_len))
+                    V_new = torch.nn.functional.pad(V_new, (0, 0, 0, pad_len))
+                K_padded.append(K_new)
+                V_padded.append(V_new)
+                kv_mask.append(torch.arange(max_len) < length)
+                k_positions.append(torch.arange(max_len))
+
+            return (
+                torch.cat(K_padded, dim=0),
+                torch.cat(V_padded, dim=0),
+                torch.tensor(q_positions, dtype=torch.long).unsqueeze(1),
+                torch.stack(k_positions),
+                torch.stack(kv_mask),
+            )
+
         K_old, V_old = self.uuid_to_tensors[uuid]
+        q_position = K_old.size(1)
         if K.dim() == K_old.dim() - 1:
             K = K.unsqueeze(0)
             V = V.unsqueeze(0)
 
-        K_new = torch.cat([K_old, K], dim=0)
-        V_new = torch.cat([V_old, V], dim=0)
+        K_new = torch.cat([K_old, K], dim=1)
+        V_new = torch.cat([V_old, V], dim=1)
 
         self.uuid_to_tensors[uuid] = [K_new, V_new]
-        return K_new, V_new
+        k_positions = torch.arange(K_new.size(1), dtype=torch.long).unsqueeze(0)
+        kv_mask = torch.ones((1, K_new.size(1)), dtype=torch.bool)
+        return K_new, V_new, torch.tensor([[q_position]], dtype=torch.long), k_positions, kv_mask
