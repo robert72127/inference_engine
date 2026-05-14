@@ -11,6 +11,7 @@ from pydantic import BaseModel
 
 from engine import BACKEND, Engine
 from models import MODEL
+from utils.logger import Logger
 
 
 class ChatMessage(BaseModel):
@@ -98,6 +99,7 @@ async def chat(req: ChatCompletionRequest):
     prompt = build_prompt(req.messages)
     created = int(time.time())
     completion_id = f"chatcmpl-{uuid.uuid4().hex}"
+    Logger.info("Chat completion request id=%s stream=%s max_tokens=%d", completion_id, req.stream, req.max_tokens)
 
     if req.stream:
         async def event_stream():
@@ -106,10 +108,12 @@ async def chat(req: ChatCompletionRequest):
                 yield f"data: {json.dumps(chunk_payload(completion_id, created, req.model, {'content': delta}))}\n\n"
             yield f"data: {json.dumps(chunk_payload(completion_id, created, req.model, {}, 'stop'))}\n\n"
             yield "data: [DONE]\n\n"
+            Logger.info("Chat completion streamed id=%s", completion_id)
 
         return StreamingResponse(event_stream(), media_type="text/event-stream")
 
     text = await engine.generate(prompt, req.max_tokens)
+    Logger.info("Chat completion finished id=%s completion_tokens=%d", completion_id, len(text.split()))
     return {
         "id": completion_id,
         "object": "chat.completion",

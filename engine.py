@@ -62,6 +62,7 @@ class Engine:
         tokens = tokenized["input_ids"][0]
 
         backend = self.schedule()
+        Logger.debug("Scheduled request prompt_tokens=%d max_tokens=%d", tokens.size(0), max_tokens)
 
         handle = await backend.prefill(tokens)
 

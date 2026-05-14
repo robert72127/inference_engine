@@ -12,15 +12,12 @@ import zmq
 import zmq.asyncio
 from torch.nn.utils.rnn import pad_sequence
 
-
 class OP(Enum):
-    WAITING = 0
     PREFILL = 1
     GENERATE = 2
-    FINISHED = 3
 
 class ServerHandle:
-    def __init__(self, handle_id: int, tokens: torch.Tensor, max_queue_size: int = 8):
+    def __init__(self, handle_id: int, tokens: torch.Tensor):
         self.id = handle_id
         self.tokens = tokens
 
@@ -179,7 +176,7 @@ class ModelProcessor:
 
     async def release(self, handle_id: int):
         with self.cv:
-            handle = self.handles.pop(handle_id, None)
+            self.handles.pop(handle_id, None)
 
     def _make_batch(self, batch: list[ServerHandle], op: OP):
         handle_ids = [h.id for h in batch]
