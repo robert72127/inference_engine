@@ -1,6 +1,5 @@
-from dataclasses import dataclass
-
 import asyncio
+import multiprocessing as mp
 import queue
 import threading
 import uuid
@@ -35,19 +34,21 @@ class RemoteHandle:
     id: int
 
 class RemoteModelProcessorHandle:
-    def __init__(self, endpoint: str, model_constructor, backend):
-        
+    def __init__(self, endpoint: str, model_constructor, backend, eos_token_id: int):
         self.ctx = zmq.asyncio.Context.instance()
         self.socket = self.ctx.socket(zmq.DEALER)
         self.socket.connect(endpoint)
 
         self.pending: dict[str, asyncio.Future] = {}
-        self.reader_task: asyncio.Task | None = None
+        self.process = mp.get_context("spawn").Process(
+            target=start_model_process,
+            args=(endpoint, model_constructor, backend, eos_token_id),
+            daemon=True,
+        )
+        self.process.start()
 
         # spawn reader
-        self.reader_task = asyncio.create_task(self._reader_loop())
-        
-        # spawn model server
+        self.reader_task = asyncio.get_running_loop().create_task(self._reader_loop())
 
     async def _reader_loop(self):
         while True:
@@ -85,12 +86,12 @@ class RemoteModelProcessorHandle:
         await self.call("RELEASE",{"handle_id": handle.id,},)
 
     async def close(self):
-        if self.reader_task:
-            self.reader_task.cancel()
         self.socket.close(linger=0)
+        if self.process.is_alive():
+            self.process.terminate()
+            self.process.join(timeout=1)
 
-
-async def run_model_server(endpoint: str, processor: ModelProcessor):
+async def run_model_server(endpoint: str, processor: "ModelProcessor"):
     ctx = zmq.asyncio.Context.instance()
     socket = ctx.socket(zmq.ROUTER)
     socket.bind(endpoint)
@@ -112,11 +113,13 @@ async def run_model_server(endpoint: str, processor: ModelProcessor):
 
         await socket.send_multipart([client_id, msgpack.packb(response, use_bin_type=True),])
 
-def start_model_process(self, model_constructor, backend):
-
-    processor = ModelProcessor(model_constructor=model_constructor,backend=backend,)
-
-    asyncio.run(run_model_server("ipc:///tmp/model-engine.ipc",processor,))
+def start_model_process(endpoint: str, model_constructor, backend, eos_token_id: int):
+    processor = ModelProcessor(
+        model_constructor=model_constructor,
+        backend=backend,
+        eos_token_id=eos_token_id,
+    )
+    asyncio.run(run_model_server(endpoint, processor))
 
 class ModelProcessor:
     def __init__(
@@ -177,19 +180,15 @@ class ModelProcessor:
 
     def _make_batch(self, batch: list[ServerHandle], op: OP):
         handle_ids = [h.id for h in batch]
-
         if op == OP.PREFILL:
             seqs = [h.tokens for h in batch]
             lengths = torch.tensor([t.size(0) for t in seqs])
-
             input_ids = pad_sequence(
                 seqs,
                 batch_first=True,
                 padding_value=0,
             )
-
             mask = torch.arange(input_ids.size(1))[None, :] < lengths[:, None]
-
             return handle_ids, input_ids, mask
 
         else:
@@ -197,7 +196,6 @@ class ModelProcessor:
                 [h.input_token for h in batch],
                 dtype=torch.long,
             )
-
             return handle_ids, input_ids, None
     
     def worker_loop(self):
@@ -205,50 +203,30 @@ class ModelProcessor:
 
         while True:
             with self.cv:
-                self.cv.wait_for(
-                    lambda: self.prefill_waiting or self.generating
-                )
+                self.cv.wait_for(lambda: self.prefill_waiting or self.generating)
 
-                if self.prefill_waiting and (
-                    next_op == OP.PREFILL or not self.generating
-                ):
+                if self.prefill_waiting and (next_op == OP.PREFILL or not self.generating):
                     op = OP.PREFILL
                     batch = self.prefill_waiting[: self.max_batch_prefill]
                     self.prefill_waiting = self.prefill_waiting[self.max_batch_prefill :]
-
                 else:
                     op = OP.GENERATE
                     batch = self.generating[: self.max_batch_generate]
 
-                batch = [
-                    h for h in batch
-                    if not h.cancelled and h.id in self.handles
-                ]
-
-            if not batch:
-                continue
-
             handle_ids, input_ids, mask = self._make_batch(batch, op)
-
             results = self.model(input_ids, op == OP.PREFILL, mask, handle_ids,)
 
             with self.cv:
                 for handle, tok in zip(batch, results):
-                    if handle.cancelled or handle.id not in self.handles:
-                        continue
-
                     handle.input_token = tok
-
                     if tok == self.eos_token_id:
                         handle.finished = True
                         self.generating = [
                             h for h in self.generating
                             if h.id != handle.id
                         ]
-
                     elif op == OP.PREFILL:
                         self.generating.append(handle)
 
                     handle.token_q.put_nowait(tok)
-
                 next_op = OP.GENERATE if op == OP.PREFILL else OP.PREFILL
