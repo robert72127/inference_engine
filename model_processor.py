@@ -35,7 +35,8 @@ class RemoteHandle:
     id: int
 
 class RemoteModelProcessorHandle:
-    def __init__(self, endpoint: str):
+    def __init__(self, endpoint: str, model_constructor, backend):
+        
         self.ctx = zmq.asyncio.Context.instance()
         self.socket = self.ctx.socket(zmq.DEALER)
         self.socket.connect(endpoint)
@@ -43,22 +44,21 @@ class RemoteModelProcessorHandle:
         self.pending: dict[str, asyncio.Future] = {}
         self.reader_task: asyncio.Task | None = None
 
-    async def start(self):
+        # spawn reader
         self.reader_task = asyncio.create_task(self._reader_loop())
+        
+        # spawn model server
 
     async def _reader_loop(self):
         while True:
             raw = await self.socket.recv()
             msg = msgpack.unpackb(raw, raw=False)
-
             fut = self.pending.pop(msg["request_id"], None)
-            if fut is None:
-                continue
-
-            if msg["ok"]:
-                fut.set_result(msg["payload"])
-            else:
-                fut.set_exception(RuntimeError(msg["error"]))
+            if fut is not  None:
+                if msg["ok"]:
+                    fut.set_result(msg["payload"])
+                else:
+                    fut.set_exception(RuntimeError(msg["error"]))
 
     async def call(self, op: str, payload: dict):
         request_id = str(uuid.uuid4())
@@ -71,7 +71,6 @@ class RemoteModelProcessorHandle:
             msgpack.packb({"request_id": request_id,"op": op,"payload": payload,},
             use_bin_type=True,)
         )
-
         return await fut
 
     async def prefill(self, tokens: torch.Tensor) -> RemoteHandle:
@@ -80,7 +79,6 @@ class RemoteModelProcessorHandle:
 
     async def next_token(self, handle: RemoteHandle) -> int:
         resp = await self.call("NEXT_TOKEN",{"handle_id": handle.id,},)
-
         return resp["token"]
 
     async def release(self, handle: RemoteHandle):
@@ -89,8 +87,36 @@ class RemoteModelProcessorHandle:
     async def close(self):
         if self.reader_task:
             self.reader_task.cancel()
-
         self.socket.close(linger=0)
+
+
+async def run_model_server(endpoint: str, processor: ModelProcessor):
+    ctx = zmq.asyncio.Context.instance()
+    socket = ctx.socket(zmq.ROUTER)
+    socket.bind(endpoint)
+
+    while True:
+        client_id, raw = await socket.recv_multipart()
+        msg = msgpack.unpackb(raw, raw=False)
+
+        op = msg["op"]
+        payload = msg["payload"]
+
+        if op == "PREFILL": result = await processor.prefill(payload["tokens"])
+
+        elif op == "NEXT_TOKEN":result = await processor.next_token(payload["handle_id"])
+
+        elif op == "RELEASE": result = await processor.release(payload["handle_id"])
+
+        response = {"request_id": msg["request_id"], "ok": True, "payload": result,}
+
+        await socket.send_multipart([client_id, msgpack.packb(response, use_bin_type=True),])
+
+def start_model_process(self, model_constructor, backend):
+
+    processor = ModelProcessor(model_constructor=model_constructor,backend=backend,)
+
+    asyncio.run(run_model_server("ipc:///tmp/model-engine.ipc",processor,))
 
 class ModelProcessor:
     def __init__(
@@ -226,40 +252,3 @@ class ModelProcessor:
                     handle.token_q.put_nowait(tok)
 
                 next_op = OP.GENERATE if op == OP.PREFILL else OP.PREFILL
-
-
-async def run_model_server(endpoint: str, processor: ModelProcessor):
-    ctx = zmq.asyncio.Context.instance()
-    socket = ctx.socket(zmq.ROUTER)
-    socket.bind(endpoint)
-
-    while True:
-        client_id, raw = await socket.recv_multipart()
-        msg = msgpack.unpackb(raw, raw=False)
-
-        op = msg["op"]
-        payload = msg["payload"]
-
-        if op == "PREFILL": result = await processor.prefill(payload["tokens"])
-
-        elif op == "NEXT_TOKEN":result = await processor.next_token(payload["handle_id"])
-
-        elif op == "RELEASE": result = await processor.release(payload["handle_id"])
-
-        response = {"request_id": msg["request_id"], "ok": True, "payload": result,}
-
-        await socket.send_multipart([client_id, msgpack.packb(response, use_bin_type=True),])
-
-def main_model_process():
-    processor = ModelProcessor(
-        model_constructor=make_model,
-        backend="cuda",
-        eos_token_id=2,
-    )
-
-    asyncio.run(
-        run_model_server(
-            "ipc:///tmp/model-engine.ipc",
-            processor,
-        )
-    )
