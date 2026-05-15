@@ -31,7 +31,7 @@ class RemoteHandle:
     id: int
 
 class RemoteModelProcessorHandle:
-    def __init__(self, endpoint: str, model_constructor, backend, eos_token_id: int):
+    def __init__(self, endpoint: str, model_constructor, device, eos_token_id: int):
         self.ctx = zmq.asyncio.Context.instance()
         self.socket = self.ctx.socket(zmq.DEALER)
         self.socket.connect(endpoint)
@@ -39,7 +39,7 @@ class RemoteModelProcessorHandle:
         self.pending: dict[str, asyncio.Future] = {}
         self.process = mp.get_context("spawn").Process(
             target=start_model_process,
-            args=(endpoint, model_constructor, backend, eos_token_id),
+            args=(endpoint, model_constructor, device, eos_token_id),
             daemon=True,
         )
         self.process.start()
@@ -110,10 +110,10 @@ async def run_model_server(endpoint: str, processor: "ModelProcessor"):
 
         await socket.send_multipart([client_id, msgpack.packb(response, use_bin_type=True),])
 
-def start_model_process(endpoint: str, model_constructor, backend, eos_token_id: int):
+def start_model_process(endpoint: str, model_constructor, device, eos_token_id: int):
     processor = ModelProcessor(
         model_constructor=model_constructor,
-        backend=backend,
+        device=device,
         eos_token_id=eos_token_id,
     )
     asyncio.run(run_model_server(endpoint, processor))
@@ -122,12 +122,13 @@ class ModelProcessor:
     def __init__(
         self,
         model_constructor,
-        backend: str,
+        device: torch.device,
         eos_token_id: int,
         max_batch_prefill: int = 8,
         max_batch_generate: int = 8,
     ):
-        self.model = model_constructor(backend)
+        self.device = torch.device(device)
+        self.model = model_constructor(self.device)
         self.eos_token_id = eos_token_id
 
         self.max_batch_prefill = max_batch_prefill
@@ -150,9 +151,9 @@ class ModelProcessor:
 
     async def prefill(self, tokens: list[int]):
         if isinstance(tokens, torch.Tensor):
-            tokens_t = tokens.detach().clone().to(dtype=torch.long)
+            tokens_t = tokens.detach().clone().to(device=self.device, dtype=torch.long)
         else:
-            tokens_t = torch.tensor(tokens, dtype=torch.long)
+            tokens_t = torch.tensor(tokens, device=self.device, dtype=torch.long)
 
         with self.cv:
             handle_id = self.next_handle_id
@@ -182,18 +183,19 @@ class ModelProcessor:
         handle_ids = [h.id for h in batch]
         if op == OP.PREFILL:
             seqs = [h.tokens for h in batch]
-            lengths = torch.tensor([t.size(0) for t in seqs])
+            lengths = torch.tensor([t.size(0) for t in seqs], device=self.device)
             input_ids = pad_sequence(
                 seqs,
                 batch_first=True,
                 padding_value=0,
             )
-            mask = torch.arange(input_ids.size(1))[None, :] < lengths[:, None]
+            mask = torch.arange(input_ids.size(1), device=self.device)[None, :] < lengths[:, None]
             return handle_ids, input_ids, mask
 
         else:
             input_ids = torch.tensor(
                 [h.input_token for h in batch],
+                device=self.device,
                 dtype=torch.long,
             ).unsqueeze(1)
             return handle_ids, input_ids, None
@@ -217,7 +219,7 @@ class ModelProcessor:
                 handle_ids, input_ids, mask = self._make_batch(batch, op)
                 request_key = tuple(handle_ids)
                 results = self.model(input_ids, op == OP.PREFILL, mask, request_key)
-                if op == OP.PREFILL:
+                if results.dim() == 3:
                     results = results[:, -1, :].argmax(dim=-1)
                 else:
                     results = results.argmax(dim=-1)

@@ -4,7 +4,7 @@ from dataclasses import dataclass
 import torch
 
 class Model(ABC):
-    def __init__(self, backend:str):
+    def __init__(self, device: torch.device):
         pass
     def __call__(self, input, prefill, mask, uuid):
         pass

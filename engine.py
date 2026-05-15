@@ -38,7 +38,13 @@ class Engine:
         eos_token_id = self.tokenizer.tokenizer.eos_token_id
 
         Logger.info(f"Launching model : {self.model.value}, with backend : {self.backend.value}, num workers : {self.model_workers_cnt}") 
-        self.workers = [ModelProcessor(model_constructor, self.backend, eos_token_id=eos_token_id) for _ in range(self.model_workers_cnt)]
+        self.workers = [
+            ModelProcessor(model_constructor,
+                torch.device(self.backend.value if self.backend == BACKEND.CPU else f"{self.backend.value}:{worker_index}"),
+                eos_token_id=eos_token_id,
+            )
+            for worker_index in range(self.model_workers_cnt)
+        ]
 
         self.next_worker = 0
 

@@ -36,11 +36,11 @@ class RMSNorm:
         return self.gamma * x * torch.rsqrt(rms + self.eps)
 
 class RoPe:
-    def __init__(self, head_dim:int, max_seq_len:int, base:float):
+    def __init__(self, head_dim:int, max_seq_len:int, base:float, device: torch.device):
         self.head_dim = head_dim
         dim_half = head_dim // 2
-        inv_freq = 1.0 / (base ** (torch.arange(0, dim_half, dtype=torch.float32) / dim_half))
-        positions = torch.arange(max_seq_len, dtype=torch.float32)
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim_half, device=device, dtype=torch.float32) / dim_half))
+        positions = torch.arange(max_seq_len, device=device, dtype=torch.float32)
         freqs = torch.outer(positions, inv_freq)   # [L, D/2]
         self.cos = freqs.cos()    # [L, D/2]
         self.sin = freqs.sin()
@@ -225,6 +225,7 @@ class STUBKVCache:
                 lengths.append(K_new.size(1))
 
             max_len = max(lengths)
+            device = K_batches[0].device
             K_padded = []
             V_padded = []
             kv_mask = []
@@ -237,13 +238,13 @@ class STUBKVCache:
                     V_new = torch.nn.functional.pad(V_new, (0, 0, 0, pad_len))
                 K_padded.append(K_new)
                 V_padded.append(V_new)
-                kv_mask.append(torch.arange(max_len) < length)
-                k_positions.append(torch.arange(max_len))
+                kv_mask.append(torch.arange(max_len, device=device) < length)
+                k_positions.append(torch.arange(max_len, device=device))
 
             return (
                 torch.cat(K_padded, dim=0),
                 torch.cat(V_padded, dim=0),
-                torch.tensor(q_positions, dtype=torch.long).unsqueeze(1),
+                torch.tensor(q_positions, device=device, dtype=torch.long).unsqueeze(1),
                 torch.stack(k_positions),
                 torch.stack(kv_mask),
             )
@@ -258,6 +259,7 @@ class STUBKVCache:
         V_new = torch.cat([V_old, V], dim=1)
 
         self.uuid_to_tensors[uuid] = [K_new, V_new]
-        k_positions = torch.arange(K_new.size(1), dtype=torch.long).unsqueeze(0)
-        kv_mask = torch.ones((1, K_new.size(1)), dtype=torch.bool)
-        return K_new, V_new, torch.tensor([[q_position]], dtype=torch.long), k_positions, kv_mask
+        device = K_new.device
+        k_positions = torch.arange(K_new.size(1), device=device, dtype=torch.long).unsqueeze(0)
+        kv_mask = torch.ones((1, K_new.size(1)), device=device, dtype=torch.bool)
+        return K_new, V_new, torch.tensor([[q_position]], device=device, dtype=torch.long), k_positions, kv_mask
