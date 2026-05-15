@@ -8,13 +8,11 @@ def top_k_top_p_sample(
     temperature: float = 1.0,
 ) -> torch.Tensor:
     """
-    Accepts logits shaped [B, L, V] (preferred) or [B, V].
+    Accepts logits shaped [B, V].
     Returns next token ids shaped [B].
     """
-    if logits.dim() == 3:
-        logits = logits[:, -1, :]  # [B, V]
-    elif logits.dim() != 2:
-        raise ValueError(f"logits must be [B,L,V] or [B,V], got {tuple(logits.shape)}")
+    if logits.dim() != 2:
+        raise ValueError(f"logits must be [B,V], got {tuple(logits.shape)}")
 
     if temperature != 1.0:
         logits = logits / temperature
