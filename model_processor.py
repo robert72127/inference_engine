@@ -12,14 +12,18 @@ import zmq
 import zmq.asyncio
 from torch.nn.utils.rnn import pad_sequence
 
+from sampling import top_k_top_p_sample
+
 class OP(Enum):
     PREFILL = 1
     GENERATE = 2
 
 class ServerHandle:
-    def __init__(self, handle_id: int, tokens: torch.Tensor):
+    def __init__(self, handle_id: int, tokens: torch.Tensor, temperature: float, top_p: float):
         self.id = handle_id
         self.tokens = tokens
+        self.temperature = temperature
+        self.top_p = top_p
 
         #  previous token for generation.
         self.input_token: int | None = None
@@ -71,8 +75,8 @@ class RemoteModelProcessorHandle:
         )
         return await fut
 
-    async def prefill(self, tokens: torch.Tensor) -> RemoteHandle:
-        resp = await self.call( "PREFILL",{"tokens": tokens.tolist(),},)
+    async def prefill(self, tokens: torch.Tensor, temperature: float = 1.0, top_p: float = 1.0) -> RemoteHandle:
+        resp = await self.call("PREFILL", {"tokens": tokens.tolist(), "temperature": temperature, "top_p": top_p})
         return RemoteHandle(id=resp["handle_id"])
 
     async def next_token(self, handle: RemoteHandle) -> int:
@@ -100,7 +104,12 @@ async def run_model_server(endpoint: str, processor: "ModelProcessor"):
         op = msg["op"]
         payload = msg["payload"]
 
-        if op == "PREFILL": result = await processor.prefill(payload["tokens"])
+        if op == "PREFILL":
+            result = await processor.prefill(
+                payload["tokens"],
+                temperature=payload.get("temperature", 1.0),
+                top_p=payload.get("top_p", 1.0),
+            )
 
         elif op == "NEXT_TOKEN":result = await processor.next_token(payload["handle_id"])
 
@@ -149,7 +158,7 @@ class ModelProcessor:
         )
         self.worker.start()
 
-    async def prefill(self, tokens: list[int]):
+    async def prefill(self, tokens: list[int], temperature: float = 1.0, top_p: float = 1.0):
         if isinstance(tokens, torch.Tensor):
             tokens_t = tokens.detach().clone().to(device=self.device, dtype=torch.long)
         else:
@@ -159,7 +168,7 @@ class ModelProcessor:
             handle_id = self.next_handle_id
             self.next_handle_id += 1
 
-            handle = ServerHandle(handle_id, tokens_t)
+            handle = ServerHandle(handle_id, tokens_t, temperature=temperature, top_p=top_p)
             self.handles[handle_id] = handle
             self.prefill_waiting.append(handle)
 
@@ -218,11 +227,8 @@ class ModelProcessor:
             with torch.inference_mode():
                 handle_ids, input_ids, mask = self._make_batch(batch, op)
                 request_key = tuple(handle_ids)
-                results = self.model(input_ids, op == OP.PREFILL, mask, request_key)
-                if results.dim() == 3:
-                    results = results[:, -1, :].argmax(dim=-1)
-                else:
-                    results = results.argmax(dim=-1)
+                logits = self.model(input_ids, op == OP.PREFILL, mask, request_key)
+                results = self._decode_batch(logits, batch)
                 results = results.tolist()
 
             with self.cv:
@@ -239,3 +245,21 @@ class ModelProcessor:
 
                     handle.token_q.put_nowait(tok)
                 next_op = OP.GENERATE if op == OP.PREFILL else OP.PREFILL
+
+    def _decode_batch(self, logits: torch.Tensor, batch: list[ServerHandle]) -> torch.Tensor:
+        if logits.dim() == 3:
+            logits = logits[:, -1, :]
+
+        tokens = []
+        for idx, handle in enumerate(batch):
+            if handle.temperature == 0.0:
+                token = logits[idx].argmax(dim=-1)
+            else:
+                token = top_k_top_p_sample(
+                    logits[idx:idx + 1],
+                    top_k=None,
+                    top_p=handle.top_p,
+                    temperature=handle.temperature,
+                ).squeeze(0)
+            tokens.append(token)
+        return torch.stack(tokens)

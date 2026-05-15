@@ -56,13 +56,13 @@ class Engine:
         self.next_worker = (self.next_worker + 1) % self.model_workers_cnt
         return worker
 
-    async def generate(self, message, max_tokens):
+    async def generate(self, message, max_tokens, temperature=1.0, top_p=1.0):
         out = []
-        async for delta in self.generate_stream(message, max_tokens):
+        async for delta in self.generate_stream(message, max_tokens, temperature=temperature, top_p=top_p):
             out.append(delta)
         return "".join(out)
 
-    async def generate_stream(self, message, max_tokens):
+    async def generate_stream(self, message, max_tokens, temperature=1.0, top_p=1.0):
         prompt = self.apply_prompt_template(message)
         tokenized = await self.tokenizer.tokenize([prompt])
         tokens = tokenized["input_ids"][0]
@@ -70,7 +70,7 @@ class Engine:
         backend = self.schedule()
         Logger.debug("Scheduled request prompt_tokens=%d max_tokens=%d", tokens.size(0), max_tokens)
 
-        handle = await backend.prefill(tokens)
+        handle = await backend.prefill(tokens, temperature=temperature, top_p=top_p)
 
         for _ in range(max_tokens):
             tok = await backend.next_token(handle)

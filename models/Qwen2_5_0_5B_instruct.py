@@ -81,7 +81,7 @@ def parse_mlp(mlp_tensors):
 
     return SwiGLUMlp(down_proj_weights=down_weights, gate_proj_weights=gate_weights, up_proj_weights=up_weights)
 
-def parse_attn(attn_tensors, num_kv_heads, num_attn_heads, max_seq_len, rope_theta):
+def parse_attn(attn_tensors, num_kv_heads, num_attn_heads, max_seq_len, rope_theta, rope):
     k_proj_bias = k_proj_weight = None
     v_proj_bias = v_proj_weight = None
     q_proj_bias = q_proj_weight = None
@@ -110,13 +110,9 @@ def parse_attn(attn_tensors, num_kv_heads, num_attn_heads, max_seq_len, rope_the
                 else: raise Exception("unknown layer, aborting")
             case "_": raise Exception("unknown layer, aborting")
 
-    if not hasattr(parse_attn, "rope"):
-        head_dim = q_proj_weight.shape[0] // num_attn_heads
-        parse_attn.rope = RoPe(head_dim, max_seq_len, rope_theta)
-
     return MultiQueryAttention(
         num_kv_heads=num_kv_heads, num_attn_heads=num_attn_heads,
-        max_seq_len=max_seq_len, rope=parse_attn.rope,
+        max_seq_len=max_seq_len, rope=rope,
         q_weights=q_proj_weight, q_bias=q_proj_bias,
         k_weights=k_proj_weight, k_bias=k_proj_bias,
         v_weights=v_proj_weight, v_bias=v_proj_bias,
@@ -124,12 +120,13 @@ def parse_attn(attn_tensors, num_kv_heads, num_attn_heads, max_seq_len, rope_the
     )
 
 # generates tensor processing graph from safetensor
-def parse_model(model_dir:Path, cfg:ModelConfig):
-    tensors = load_file(model_dir)
+def parse_model(model_dir:Path, cfg:ModelConfig, device: torch.device):
+    tensors = load_file(model_dir, device=str(device))
 
     hidden_layers = {}
     model = []
     KV_caches = []
+    rope_head_dim = None
 
     for name, arr in tensors.items():
         chunks = name.split(".")
@@ -152,7 +149,14 @@ def parse_model(model_dir:Path, cfg:ModelConfig):
                 if pos not in hidden_layers:
                     hidden_layers[pos] = {}
                 hidden_layers[pos].setdefault(layer, []).append({"layer": rest, "array": arr})
+                if layer == "self_attn" and rest[0] == "q_proj" and rest[1] == "weight" and rope_head_dim is None:
+                    rope_head_dim = arr.shape[0] // cfg.n_attn_heads
             case _ : raise Exception("Unknown layer, aborting")
+
+    if rope_head_dim is None:
+        raise Exception("Missing q_proj weights, cannot initialize RoPE")
+
+    rope = RoPe(rope_head_dim, cfg.max_seq_len, cfg.rope_theta, device)
 
     # parse layers
     for layer in dict(sorted(hidden_layers.items())).values():
@@ -166,7 +170,7 @@ def parse_model(model_dir:Path, cfg:ModelConfig):
                 case "mlp":
                     mlp = parse_mlp(layer[sub_layer])
                 case "self_attn":
-                    self_attn = parse_attn(layer[sub_layer], cfg.n_kv_heads, cfg.n_attn_heads, cfg.max_seq_len, cfg.rope_theta)
+                    self_attn = parse_attn(layer[sub_layer], cfg.n_kv_heads, cfg.n_attn_heads, cfg.max_seq_len, cfg.rope_theta, rope)
                     #KV_caches.append(self_attn.KV_CACHE)
                 case _: raise Exception("Unknown layer, aborting")
         model += [(TransformerBlock(mlp, input_layernorm, self_attn, post_attention_layernorm), True)] 
@@ -179,22 +183,24 @@ def parse_model(model_dir:Path, cfg:ModelConfig):
 class Qwen2_5_0_5B_Instruct(Model):
     model_dir = model_dir
     
-    def __init__(self, backend):
+    def __init__(self, device: torch.device):
         model_file = model_dir / "model.safetensors"
         config = model_dir / "config.json"
         with open(config, "r") as f: cfg = json.load(f)
         model_cfg = ModelConfig(cfg)
+        self.device = torch.device(device)
         self.model_dir = model_dir 
-        self.layers = parse_model(model_file, model_cfg)
+        self.layers = parse_model(model_file, model_cfg, self.device)
   
     @torch.inference_mode()
     def __call__(self, input, prefill, mask, uuid):
-        out = input
+        out = input.to(self.device)
+        mask = None if mask is None else mask.to(self.device)
         for layer in self.layers: 
             layer, is_transformer = layer
             out = layer(out, prefill=prefill, mask=mask, uuid=uuid) if is_transformer else layer(out)
         return out
 
 if __name__ == '__main__':
-    model = Qwen2_5_0_5B_Instruct()
+    model = Qwen2_5_0_5B_Instruct(torch.device("cpu"))
     print_model()

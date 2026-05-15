@@ -29,6 +29,13 @@ class ChatCompletionRequest(BaseModel):
     stop: str | list[str] | None = None
 
 
+def validate_sampling_params(temperature: float, top_p: float):
+    if temperature < 0:
+        raise HTTPException(status_code=400, detail="temperature must be >= 0")
+    if not 0 < top_p <= 1:
+        raise HTTPException(status_code=400, detail="top_p must be in (0, 1]")
+
+
 def parse_model(model_name: str) -> MODEL:
     try:
         return MODEL(model_name)
@@ -97,6 +104,7 @@ async def chat(req: ChatCompletionRequest):
         )
 
     prompt = build_prompt(req.messages)
+    validate_sampling_params(req.temperature, req.top_p)
     created = int(time.time())
     completion_id = f"chatcmpl-{uuid.uuid4().hex}"
     Logger.info("Chat completion request id=%s stream=%s max_tokens=%d", completion_id, req.stream, req.max_tokens)
@@ -104,7 +112,7 @@ async def chat(req: ChatCompletionRequest):
     if req.stream:
         async def event_stream():
             yield f"data: {json.dumps(chunk_payload(completion_id, created, req.model, {'role': 'assistant'}))}\n\n"
-            async for delta in engine.generate_stream(prompt, req.max_tokens):
+            async for delta in engine.generate_stream(prompt, req.max_tokens, temperature=req.temperature, top_p=req.top_p,):
                 yield f"data: {json.dumps(chunk_payload(completion_id, created, req.model, {'content': delta}))}\n\n"
             yield f"data: {json.dumps(chunk_payload(completion_id, created, req.model, {}, 'stop'))}\n\n"
             yield "data: [DONE]\n\n"
@@ -112,7 +120,7 @@ async def chat(req: ChatCompletionRequest):
 
         return StreamingResponse(event_stream(), media_type="text/event-stream")
 
-    text = await engine.generate(prompt, req.max_tokens)
+    text = await engine.generate(prompt,req.max_tokens,temperature=req.temperature,top_p=req.top_p)
     Logger.info("Chat completion finished id=%s completion_tokens=%d", completion_id, len(text.split()))
     return {
         "id": completion_id,
