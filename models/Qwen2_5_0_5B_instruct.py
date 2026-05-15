@@ -125,7 +125,6 @@ def parse_attn(attn_tensors, num_kv_heads, num_attn_heads, max_seq_len, rope_the
 
 # generates tensor processing graph from safetensor
 def parse_model(model_dir:Path, cfg:ModelConfig):
-
     tensors = load_file(model_dir)
 
     hidden_layers = {}
@@ -188,6 +187,7 @@ class Qwen2_5_0_5B_Instruct(Model):
         self.model_dir = model_dir 
         self.layers = parse_model(model_file, model_cfg)
   
+    @torch.inference_mode()
     def __call__(self, input, prefill, mask, uuid):
         out = input
         for layer in self.layers: 

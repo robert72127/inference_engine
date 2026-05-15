@@ -213,14 +213,15 @@ class ModelProcessor:
                     op = OP.GENERATE
                     batch = self.generating[: self.max_batch_generate]
 
-            handle_ids, input_ids, mask = self._make_batch(batch, op)
-            request_key = tuple(handle_ids)
-            results = self.model(input_ids, op == OP.PREFILL, mask, request_key)
-            if op == OP.PREFILL:
-                results = results[:, -1, :].argmax(dim=-1)
-            else:
-                results = results.argmax(dim=-1)
-            results = results.tolist()
+            with torch.inference_mode():
+                handle_ids, input_ids, mask = self._make_batch(batch, op)
+                request_key = tuple(handle_ids)
+                results = self.model(input_ids, op == OP.PREFILL, mask, request_key)
+                if op == OP.PREFILL:
+                    results = results[:, -1, :].argmax(dim=-1)
+                else:
+                    results = results.argmax(dim=-1)
+                results = results.tolist()
 
             with self.cv:
                 for handle, tok in zip(batch, results):

@@ -202,7 +202,7 @@ class STUBKVCache:
     def prefill(self, uuid, K, V):
         if isinstance(uuid, (list, tuple)):
             for idx, handle_id in enumerate(uuid):
-                self.uuid_to_tensors[handle_id] = [K[idx:idx + 1], V[idx:idx + 1]]
+                self.uuid_to_tensors[handle_id] = [K[idx:idx + 1].detach(), V[idx:idx + 1].detach(),]
             return
 
         self.uuid_to_tensors[uuid] = [K, V]

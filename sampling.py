@@ -1,5 +1,6 @@
 import torch
 
+@torch.inference_mode()
 def top_k_top_p_sample(
     logits: torch.Tensor,
     top_k: int = 50,
