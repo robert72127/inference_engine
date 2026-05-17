@@ -195,6 +195,64 @@ class TransformerBlock:
         mlp_in = self.post_norm(x)
         return  x + self.mlp(mlp_in)
 
+class KVCache:
+    def __init__(self, d_model, max_requests, max_request_len):
+        self.d_model = d_model
+        self.max_requests = max_requests
+        self.max_requests_len = max_request_len
+
+        self.uuid_to_pos = {}
+        self.uuid_to_len= {}
+        self.free_slots = [i for i in range (max_requests)]
+
+        self.K = torch.tensor((max_requests, max_request_len, d_model))
+        self.V = torch.tensor((max_requests, max_request_len, d_model))
+
+    def _get_index(self, uuid):
+        if uuid in self.uuid_to_pos:
+            return self.uuid_to_pos[uuid]
+        elif self.free_slots == []:
+            raise RuntimeError("Logical error in requests handling: Request was made for next slot but, KV cache is full")
+        else:
+            index = self.free_slots.pop()
+            self.uuid_to_pos[uuid] = index
+            self.uuid_to_len[uuid] = 0
+
+    def _get_tensor_and_meta(self, uuid):
+        index = self._get_index(uuid)
+        return self.K[index], self.V[index], index, self.uuid_to_len[uuid]
+
+    def _free_index(self, uuid):
+        if uuid in self.uuid_to_pos:
+            index = self.uuid.to_pos[uuid]
+            del self.uuid.to_pos[uuid]
+            del self.uuid_to_len(uuid)
+            self.free_slots += [index]
+
+    def prefill(self, uuids, K, V, mask):
+        for i, uuid in enumerate(uuids):
+            len = mask[i].sum()
+            K_ = K[i][:len]
+            V_ = V[i][:len]
+            K_cached, V_cached, index, _ = self._get_tensor_and_meta(uuid)
+            K_cached = K_
+            V_cached = V_
+            self.uuid_to_len[uuid] = len
+
+    def append_and_fetch(self, uuids, K, V):
+        K_ = []
+        V_ = []
+        for i, uuid in enumerate(uuids):
+            K_cached, V_cached, index, len = self._get_tensor_and_meta(uuid)
+            if len == self.max_requests_len:
+                raise RuntimeError("Logical error in request handling: Sequence to long, should not be possible")
+            K_cached[len:len+1] = K[i]
+            V_cached[len:len+1] = V[i]
+            self.uuid_to_len[uuid] = len + 1
+            K_ += [K_cached]
+            V_ += [V_cached]
+        return torch.stack(K_, V_)
+
 class STUBKVCache:
     def __init__(self):
         self.uuid_to_tensors = {}
