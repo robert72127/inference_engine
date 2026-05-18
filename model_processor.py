@@ -24,6 +24,7 @@ class ServerHandle:
         self.tokens = tokens
         self.temperature = temperature
         self.top_p = top_p
+        self.cache_len = int(tokens.size(0))
 
         #  previous token for generation.
         self.input_token: int | None = None
@@ -35,7 +36,7 @@ class RemoteHandle:
     id: int
 
 class RemoteModelProcessorHandle:
-    def __init__(self, endpoint: str, model_constructor, device, eos_token_id: int):
+    def __init__(self, endpoint: str, model_constructor, device, eos_token_id: int, max_request_len: int):
         self.ctx = zmq.asyncio.Context.instance()
         self.socket = self.ctx.socket(zmq.DEALER)
         self.socket.connect(endpoint)
@@ -43,7 +44,7 @@ class RemoteModelProcessorHandle:
         self.pending: dict[str, asyncio.Future] = {}
         self.process = mp.get_context("spawn").Process(
             target=start_model_process,
-            args=(endpoint, model_constructor, device, eos_token_id),
+            args=(endpoint, model_constructor, device, eos_token_id, max_request_len),
             daemon=True,
         )
         self.process.start()
@@ -119,11 +120,12 @@ async def run_model_server(endpoint: str, processor: "ModelProcessor"):
 
         await socket.send_multipart([client_id, msgpack.packb(response, use_bin_type=True),])
 
-def start_model_process(endpoint: str, model_constructor, device, eos_token_id: int):
+def start_model_process(endpoint: str, model_constructor, device, eos_token_id: int, max_request_len: int):
     processor = ModelProcessor(
-        model_constructor==model_constructor,
+        model_constructor=model_constructor,
         device=device,
         eos_token_id=eos_token_id,
+        max_request_len=max_request_len,
     )
     asyncio.run(run_model_server(endpoint, processor))
 
@@ -133,12 +135,14 @@ class ModelProcessor:
         model_constructor,
         device: torch.device,
         eos_token_id: int,
+        max_request_len: int,
         max_batch_prefill: int = 8,
         max_batch_generate: int = 8,
     ):
         self.device = torch.device(device)
         self.model = model_constructor(self.device)
         self.kv_caches = list(getattr(self.model, "kv_caches", []))
+        self.max_request_len = max_request_len
         self.eos_token_id = eos_token_id
 
         self.max_batch_prefill = max_batch_prefill
@@ -165,6 +169,11 @@ class ModelProcessor:
         else:
             tokens_t = torch.tensor(tokens, device=self.device, dtype=torch.long)
 
+        if tokens_t.size(0) > self.max_request_len:
+            raise RuntimeError(
+                f"Prompt length {tokens_t.size(0)} exceeds KV cache capacity {self.max_request_len}"
+            )
+
         with self.cv:
             handle_id = self.next_handle_id
             self.next_handle_id += 1
@@ -180,6 +189,8 @@ class ModelProcessor:
     async def next_token(self, handle_id: int):
         with self.lock:
             handle = self.handles.get(handle_id)
+        if handle is None:
+            return self.eos_token_id
 
         loop = asyncio.get_running_loop()
         tok = await loop.run_in_executor(None,handle.token_q.get,)
@@ -227,6 +238,21 @@ class ModelProcessor:
                     op = OP.GENERATE
                     batch = self.generating[: self.max_batch_generate]
 
+            if op == OP.GENERATE:
+                full = [handle for handle in batch if handle.cache_len >= self.max_request_len]
+                if full:
+                    with self.cv:
+                        for handle in full:
+                            handle.finished = True
+                            self.generating = [h for h in self.generating if h.id != handle.id]
+                            self.handles.pop(handle.id, None)
+                            self._release_caches(handle.id)
+                            handle.token_q.put_nowait(self.eos_token_id)
+                    batch = [handle for handle in batch if handle.cache_len < self.max_request_len]
+                    if not batch:
+                        next_op = OP.PREFILL
+                        continue
+
             with torch.inference_mode():
                 handle_ids, input_ids, mask = self._make_batch(batch, op)
                 request_key = tuple(handle_ids)
@@ -237,6 +263,8 @@ class ModelProcessor:
             with self.cv:
                 for handle, tok in zip(batch, results):
                     released = handle.id not in self.handles
+                    if op == OP.GENERATE:
+                        handle.cache_len += 1
                     handle.input_token = tok
                     if tok == self.eos_token_id or released:
                         handle.finished = True

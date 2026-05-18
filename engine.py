@@ -51,6 +51,7 @@ class Engine:
             ModelProcessor(model_factory,
                 torch.device(self.backend.value if self.backend == BACKEND.CPU else f"{self.backend.value}:{worker_index}"),
                 eos_token_id=eos_token_id,
+                max_request_len=max_cache_seq_len,
             )
             for worker_index in range(self.model_workers_cnt)
         ]
