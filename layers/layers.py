@@ -245,12 +245,12 @@ class PagedKVCache:
             i = 0
             for blck in self.commited_blocks:
                 for j in range(self.block_size):
-                    K[i][j] = self.kv_cache.K[blck][j]
-                    V[i][j] = self.kv_cache.V[blck][j]
+                    K[i * self.block_size + j] = self.kv_cache.K[blck][j]
+                    V[i * self.block_size + j] = self.kv_cache.V[blck][j]
                     i+= 1
             for j in range(self.write_block_occupancy):
-                K[i][j] = self.kv_cache.K[self.write_block][j]
-                V[i][j] = self.kv_cache.V[self.write_block][j]
+                K[i * self.block_size + j] = self.kv_cache.K[self.write_block][j]
+                V[i * self.block_size + j] = self.kv_cache.V[self.write_block][j]
 
     def __init__(self, d_model, num_blocks, block_size, device, dtype):
         self.d_model = d_model
@@ -260,16 +260,16 @@ class PagedKVCache:
         self.uuids = {}
 
         self.free_slots = deque([i for i in range (num_blocks)])
-        self.fr// soee_slots_cnt = num_blocks
+        self.free_slots_cnt = num_blocks
 
         self.device = device
         self.dtype = dtype
         self.K = torch.zeros((num_blocks, block_size, d_model), device=device, dtype=dtype)
         self.V = torch.zeros((num_blocks, block_size, d_model), device=device, dtype=dtype)
 
-    # can be like computed by how much blocks total can current request count take
+    # todo extract info from this in the engine
     def get_occupancy_info(self):
-        return self.size, self.free_slots_cnt
+        return self.blocks_cnt * self.block_size, self.free_slots_cnt, len(self.uuids)
     
     def get_free_blocks(self, block_cnt=1):
         blocks = [self.free_slots.popleft() for _ in range(block_cnt)]
@@ -324,9 +324,27 @@ class PagedKVCache:
             uuid_state = self.uuids[uuid]
             uuid_state.fill(K[i], V[i])
 
-        mask = torch.arange(max_len).expand(len(lengths), max_len) < lengths.unsqueeze(1)
-        return K, V, mask
-    
+        lengths_t = torch.tensor(lengths, device=self.device, dtype=torch.long)
+
+        kv_mask = (
+            torch.arange(max_len, device=self.device)
+            .unsqueeze(0)
+            .expand(batch_size, max_len) < lengths_t.unsqueeze(1))
+
+        k_positions = (
+            torch.arange(max_len, device=self.device, dtype=torch.long)
+            .unsqueeze(0)
+            .expand(batch_size, max_len)
+        )
+
+        q_positions = torch.tensor(
+            q_positions,
+            device=self.device,
+            dtype=torch.long,
+        ).unsqueeze(1)
+        
+        return K, Vout, q_positions, k_positions, kv_mask
+
     def release(self, uuids):
         for uuid in uuids:
             self._free_blocks(uuid)
