@@ -75,7 +75,10 @@ async def lifespan(app: FastAPI):
     model = parse_model(os.getenv("MODEL_NAME", MODEL.QWEN_2_5_0_5B_INSTRUCT.value))
     backend = BACKEND(os.getenv("MODEL_BACKEND", BACKEND.CPU.value))
     max_workers = int(os.getenv("MODEL_MAX_WORKERS", "1"))
-    app.state.engine = Engine(model=model, backend=backend, max_workers=max_workers)
+    max_proc_req = int(os.getenv("MODEL_MAX_PROC_REQ", "100"))
+    max_cache_seq_len = int(os.getenv("MODEL_MAX_CACHE_SEQ_LEN", "4096"))
+    app.state.engine = Engine(model=model, backend=backend, max_workers=max_workers,
+        max_proc_req=max_proc_req,max_cache_seq_len=max_cache_seq_len,)
     yield
 
 

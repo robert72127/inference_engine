@@ -121,7 +121,7 @@ async def run_model_server(endpoint: str, processor: "ModelProcessor"):
 
 def start_model_process(endpoint: str, model_constructor, device, eos_token_id: int):
     processor = ModelProcessor(
-        model_constructor=model_constructor,
+        model_constructor==model_constructor,
         device=device,
         eos_token_id=eos_token_id,
     )
@@ -138,6 +138,7 @@ class ModelProcessor:
     ):
         self.device = torch.device(device)
         self.model = model_constructor(self.device)
+        self.kv_caches = list(getattr(self.model, "kv_caches", []))
         self.eos_token_id = eos_token_id
 
         self.max_batch_prefill = max_batch_prefill
@@ -187,6 +188,8 @@ class ModelProcessor:
     async def release(self, handle_id: int):
         with self.cv:
             self.handles.pop(handle_id, None)
+            self.prefill_waiting = [h for h in self.prefill_waiting if h.id != handle_id]
+            self.cv.notify()
 
     def _make_batch(self, batch: list[ServerHandle], op: OP):
         handle_ids = [h.id for h in batch]
@@ -233,17 +236,21 @@ class ModelProcessor:
 
             with self.cv:
                 for handle, tok in zip(batch, results):
+                    released = handle.id not in self.handles
                     handle.input_token = tok
-                    if tok == self.eos_token_id:
+                    if tok == self.eos_token_id or released:
                         handle.finished = True
                         self.generating = [
                             h for h in self.generating
                             if h.id != handle.id
                         ]
+                        self.handles.pop(handle.id, None)
+                        self._release_caches(handle.id)
                     elif op == OP.PREFILL:
                         self.generating.append(handle)
 
-                    handle.token_q.put_nowait(tok)
+                    if not released:
+                        handle.token_q.put_nowait(tok)
                 next_op = OP.GENERATE if op == OP.PREFILL else OP.PREFILL
 
     def _decode_batch(self, logits: torch.Tensor, batch: list[ServerHandle]) -> torch.Tensor:
@@ -263,3 +270,7 @@ class ModelProcessor:
                 ).squeeze(0)
             tokens.append(token)
         return torch.stack(tokens)
+
+    def _release_caches(self, handle_id: int):
+        for cache in self.kv_caches:
+            cache.release(handle_id)

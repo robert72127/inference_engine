@@ -81,7 +81,16 @@ def parse_mlp(mlp_tensors):
 
     return SwiGLUMlp(down_proj_weights=down_weights, gate_proj_weights=gate_weights, up_proj_weights=up_weights)
 
-def parse_attn(attn_tensors, num_kv_heads, num_attn_heads, max_seq_len, rope_theta, rope):
+def parse_attn(
+    attn_tensors,
+    num_kv_heads,
+    num_attn_heads,
+    max_seq_len,
+    rope_theta,
+    rope,
+    cache_max_requests,
+    cache_max_seq_len,
+):
     k_proj_bias = k_proj_weight = None
     v_proj_bias = v_proj_weight = None
     q_proj_bias = q_proj_weight = None
@@ -117,15 +126,23 @@ def parse_attn(attn_tensors, num_kv_heads, num_attn_heads, max_seq_len, rope_the
         k_weights=k_proj_weight, k_bias=k_proj_bias,
         v_weights=v_proj_weight, v_bias=v_proj_bias,
         out_proj_weights=o_proj_weight, out_proj_bias=o_proj_bias,
+        cache_max_requests=cache_max_requests,
+        cache_max_seq_len=cache_max_seq_len,
     )
 
 # generates tensor processing graph from safetensor
-def parse_model(model_dir:Path, cfg:ModelConfig, device: torch.device):
+def parse_model(
+    model_dir: Path,
+    cfg: ModelConfig,
+    device: torch.device,
+    cache_max_requests: int,
+    cache_max_seq_len: int,
+):
     tensors = load_file(model_dir, device=str(device))
 
     hidden_layers = {}
     model = []
-    KV_caches = []
+    kv_caches = []
     rope_head_dim = None
 
     for name, arr in tensors.items():
@@ -170,27 +187,47 @@ def parse_model(model_dir:Path, cfg:ModelConfig, device: torch.device):
                 case "mlp":
                     mlp = parse_mlp(layer[sub_layer])
                 case "self_attn":
-                    self_attn = parse_attn(layer[sub_layer], cfg.n_kv_heads, cfg.n_attn_heads, cfg.max_seq_len, cfg.rope_theta, rope)
-                    #KV_caches.append(self_attn.KV_CACHE)
+                    self_attn = parse_attn(
+                        layer[sub_layer],
+                        cfg.n_kv_heads,
+                        cfg.n_attn_heads,
+                        cfg.max_seq_len,
+                        cfg.rope_theta,
+                        rope,
+                        cache_max_requests,
+                        cache_max_seq_len,
+                    )
+                    kv_caches.append(self_attn.KV_cache)
                 case _: raise Exception("Unknown layer, aborting")
         model += [(TransformerBlock(mlp, input_layernorm, self_attn, post_attention_layernorm), True)] 
 
     model += [(output_norm, False), ( output_embed, False)]
 
 
-    return model #, KV_caches
+    return model, kv_caches
 
 class Qwen2_5_0_5B_Instruct(Model):
     model_dir = model_dir
     
-    def __init__(self, device: torch.device):
+    def __init__(
+        self,
+        device: torch.device,
+        cache_max_requests: int,
+        cache_max_seq_len: int,
+    ):
         model_file = model_dir / "model.safetensors"
         config = model_dir / "config.json"
         with open(config, "r") as f: cfg = json.load(f)
         model_cfg = ModelConfig(cfg)
         self.device = torch.device(device)
         self.model_dir = model_dir 
-        self.layers = parse_model(model_file, model_cfg, self.device)
+        self.layers, self.kv_caches = parse_model(
+            model_file,
+            model_cfg,
+            self.device,
+            cache_max_requests=cache_max_requests,
+            cache_max_seq_len=cache_max_seq_len,
+        )
   
     @torch.inference_mode()
     def __call__(self, input, prefill, mask, uuid):
@@ -202,5 +239,5 @@ class Qwen2_5_0_5B_Instruct(Model):
         return out
 
 if __name__ == '__main__':
-    model = Qwen2_5_0_5B_Instruct(torch.device("cpu"))
+    model = Qwen2_5_0_5B_Instruct(torch.device("cpu"), cache_max_requests=100, cache_max_seq_len=4096)
     print_model()

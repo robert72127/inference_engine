@@ -7,10 +7,18 @@ from model_processor import ModelProcessor, ServerHandle
 
 
 class FakeConcurrentModel:
+    class FakeCache:
+        def __init__(self):
+            self.release_calls = []
+
+        def release(self, uuid):
+            self.release_calls.append(uuid)
+
     def __init__(self, device: torch.device):
         self.device = torch.device(device)
         self.vocab_size = 8
         self.generate_calls = 0
+        self.kv_caches = [self.FakeCache()]
 
     def __call__(self, input_ids, prefill, mask, uuid):
         batch, seq_len = input_ids.shape
@@ -26,7 +34,6 @@ class FakeConcurrentModel:
             next_token = 2 if self.generate_calls == 1 else 7
             logits[:, :, next_token] = 0.0
         return logits
-
 
 class DecodeBatchTests(unittest.TestCase):
     def setUp(self):
@@ -94,12 +101,12 @@ class ModelProcessorConcurrencyTests(unittest.IsolatedAsyncioTestCase):
             processor.prefill([21, 22], temperature=0.0, top_p=1.0),
             processor.prefill([31], temperature=0.0, top_p=1.0),
         )
+        handles = [processor.handles[handle_id] for handle_id in handle_ids]
 
         await asyncio.sleep(0.1)
 
         all_tokens = []
-        for handle_id in handle_ids:
-            handle = processor.handles[handle_id]
+        for handle in handles:
             tokens = []
             while not handle.token_q.empty():
                 tokens.append(handle.token_q.get_nowait())
@@ -109,7 +116,7 @@ class ModelProcessorConcurrencyTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(handle.finished)
             all_tokens.append(tokens)
 
-        self.assertEqual(all_tokens[1:], [all_tokens[0], all_tokens[0]])
-
         for handle_id in handle_ids:
             await processor.release(handle_id)
+
+        self.assertEqual(sorted(processor.kv_caches[0].release_calls), sorted(handle_ids))

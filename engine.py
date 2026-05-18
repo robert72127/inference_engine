@@ -1,6 +1,7 @@
 from enum import Enum
 import os
 import importlib
+from functools import partial
 import torch
 
 from utils.logger import Logger
@@ -23,7 +24,14 @@ class BACKEND(Enum):
             case BACKEND.CUDA: return torch.cuda.is_available()
 
 class Engine:
-    def __init__(self, model: MODEL, backend: BACKEND, max_workers=1, max_proc_req=100):
+    def __init__(
+        self, 
+        model: MODEL,
+        backend: BACKEND,
+        max_workers=1,
+        max_proc_req=100,
+        max_cache_seq_len=4096,
+    ):
         # detect backend and init
         self.backend = backend if backend.is_available() else BACKEND.CPU
         self.model = model
@@ -32,6 +40,7 @@ class Engine:
         module = importlib.import_module(f"models.{models[model]['module']}")
         model_dir = module.get_model_dir() 
         model_constructor = getattr(module, models[model]['constructor'])
+        model_factory = partial(model_constructor, cache_max_requests=max_proc_req, cache_max_seq_len=max_cache_seq_len,)
 
         Logger.info(f"Launching tokenizer server for model : {self.model.value}")
         self.tokenizer =  Tokenizer(model_dir=model_dir)
@@ -39,7 +48,7 @@ class Engine:
 
         Logger.info(f"Launching model : {self.model.value}, with backend : {self.backend.value}, num workers : {self.model_workers_cnt}") 
         self.workers = [
-            ModelProcessor(model_constructor,
+            ModelProcessor(model_factory,
                 torch.device(self.backend.value if self.backend == BACKEND.CPU else f"{self.backend.value}:{worker_index}"),
                 eos_token_id=eos_token_id,
             )
