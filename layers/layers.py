@@ -206,3 +206,107 @@ class TransformerBlock:
         mlp_in = self.post_norm(x)
         return  x + self.mlp(mlp_in)
 
+# todo modify model processor to admit reject new requests based on usage of cache
+# before admiting new req: needed_blocks = ceil((prompt_len + max_new_tokens) / block_size)
+
+from collections import deque
+
+class PagedKVCache:
+    def __init__(self, d_model, num_blocks, device, dtype):
+        self.d_model = d_model
+        self.size = num_blocks
+
+        self.uuid_to_pages = {}
+        self.uuid_to_len= {}
+        self.length_by_uuid = self.uuid_to_len
+
+        self.free_slots = deque([i for i in range (num_blocks)])
+        self.free_slots_cnt = num_blocks
+
+        self.device = device
+        self.dtype = dtype
+        self.K = torch.zeros((num_blocks, d_model), device=device, dtype=dtype)
+        self.V = torch.zeros((num_blocks, d_model), device=device, dtype=dtype)
+
+
+    def get_occupancy_info(self):
+        return self.size, self.free_slots_cnt
+
+    def _get_new_indexes(self, uuid, index_cnt = 1):
+        slots = [self.free_slots.popleft() for _ in range(index_cnt)]
+        self.free_slots_cnt -= index_cnt
+        if uuid in self.uuid_to_pages:
+            self.uuid_to_pages[uuid] += slots
+            self.uuid_to_len[uuid] += index_cnt
+        else:
+            self.uuid_to_pages[uuid] = slots
+            self.uuid_to_len[uuid] = index_cnt
+        return slots
+
+    def _get_indexes(self, uuid):
+        if uuid in self.uuid_to_pages: return []
+        return self.uuid_to_pages[uuid]
+
+    def _free_blocks(self, uuid):
+        if uuid in self.uuid_to_pages:
+            block_idxs = self.uuid_to_pages.pop(uuid)
+            len = self.uuid_to_len.pop(uuid)
+            self.free_slots_cnt += len
+            self.free_slots += block_idxs
+
+    def _get_pages_and_meta(self, uuid):
+        pages_K = []
+        pages_V = []
+        for idx in self.uuid_to_pages[uuid]:
+            pages_K += [self.K[idx]]
+            pages_V += [self.V[idx]]
+        return pages_K, pages_V, self.uuid_to_len[uuid]
+    
+    def prefill(self, uuids, K, V, mask):
+        for i, uuid in enumerate(self, uuid):
+            seq_len = int(mask[i].sum().item())
+            self._get_indexes(uuid, seq_len)
+            pages_K, pages_V, _ = self._get_pages_and_meta(uuid)
+            for j in range(seq_len):
+                pages_K[j] = K[i][j]
+                pages_V[j] = V[i][j]
+    
+    def append_and_fetch(self, uuids, K, V):
+        K_ = []
+        V_ = []
+        q_positions = []
+        lengths = []
+        lengths = []
+        max_len = 0
+        for i, uuid in enumerate(uuids):
+            self._get_new_indexes(uuid)
+            K_cached, V_cached, len = self._get_pages_and_meta(uuid)
+            K_cached[-1] = K[i]
+            V_cached[-1] = V[i]
+            max_len = max(max_len, len)
+            K_i = torch.tensor((len, self.d_model), device=self.device, dtype=self.dtype)
+            V_i = torch.tensor((len, self.d_model), device=self.device, dtype=self.dtype)
+            for j in range(len):
+                K_i[j] = K_cached[j]
+                V_i[j] = V_cached[j]
+        
+        kv_mask = []
+        k_positions = []
+        for uuid, seq_len in zip(uuids, lengths):
+            slot = self.uuid_to_slot[uuid]
+            K_ += [self.K[slot, :max_len]]
+            V_ += [self.V[slot, :max_len]]
+            kv_mask += [torch.arange(max_len, device=K.device) < seq_len]
+            k_positions += [torch.arange(max_len, device=K.device, dtype=torch.long)]
+
+        return (
+            torch.stack(K_),
+            torch.stack(V_),
+            torch.tensor(q_positions, device=K.device, dtype=torch.long).unsqueeze(1),
+            torch.stack(k_positions),
+            torch.stack(kv_mask),
+        )
+
+    def release(self, uuids):
+        for uuid in uuids:
+            self._free_blocks(uuid)
