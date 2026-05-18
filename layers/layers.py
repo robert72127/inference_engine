@@ -212,101 +212,121 @@ class TransformerBlock:
 from collections import deque
 
 class PagedKVCache:
-    def __init__(self, d_model, num_blocks, device, dtype):
-        self.d_model = d_model
-        self.size = num_blocks
 
-        self.uuid_to_pages = {}
-        self.uuid_to_len= {}
-        self.length_by_uuid = self.uuid_to_len
+    class UUIDState:
+        def __init__(self, 
+                    kv_cache,
+                    block_size,
+                    blocks_count,
+                    commited_blocks,
+                    write_block,
+                    write_block_occupancy):
+            
+            self.kv_cache = kv_cache
+            self.block_size = block_size
+
+            self.commited_blocks = commited_blocks
+            self.write_block = write_block
+            self.blocks_count = blocks_count
+            self.write_block_occupancy = write_block_occupancy
+
+        def insert_single(self, K,V):
+            if self.write_block_occupancy == self.kv_cache.block_size:
+               self.commited_blocks += [self.write_block]
+               self.write_block = self.kv_cache.get_free_blocks()[0]
+               self.write_block_occupancy = 0 
+               self.blocks_count +=1
+
+            self.kv_cache.K[self.write_block][self.write_block_occupancy] = K 
+            self.kv_cache.V[self.write_block][self.write_block_occupancy] = V 
+            self.write_block_occupancy+=1
+
+        def fill(self, K, V):
+            i = 0
+            for blck in self.commited_blocks:
+                for j in range(self.block_size):
+                    K[i][j] = self.kv_cache.K[blck][j]
+                    V[i][j] = self.kv_cache.V[blck][j]
+                    i+= 1
+            for j in range(self.write_block_occupancy):
+                K[i][j] = self.kv_cache.K[self.write_block][j]
+                V[i][j] = self.kv_cache.V[self.write_block][j]
+
+    def __init__(self, d_model, num_blocks, block_size, device, dtype):
+        self.d_model = d_model
+        self.blocks_cnt = num_blocks
+        self.block_size = block_size
+
+        self.uuids = {}
 
         self.free_slots = deque([i for i in range (num_blocks)])
-        self.free_slots_cnt = num_blocks
+        self.fr// soee_slots_cnt = num_blocks
 
         self.device = device
         self.dtype = dtype
-        self.K = torch.zeros((num_blocks, d_model), device=device, dtype=dtype)
-        self.V = torch.zeros((num_blocks, d_model), device=device, dtype=dtype)
+        self.K = torch.zeros((num_blocks, block_size, d_model), device=device, dtype=dtype)
+        self.V = torch.zeros((num_blocks, block_size, d_model), device=device, dtype=dtype)
 
-
+    # can be like computed by how much blocks total can current request count take
     def get_occupancy_info(self):
         return self.size, self.free_slots_cnt
-
-    def _get_new_indexes(self, uuid, index_cnt = 1):
-        slots = [self.free_slots.popleft() for _ in range(index_cnt)]
-        self.free_slots_cnt -= index_cnt
-        if uuid in self.uuid_to_pages:
-            self.uuid_to_pages[uuid] += slots
-            self.uuid_to_len[uuid] += index_cnt
-        else:
-            self.uuid_to_pages[uuid] = slots
-            self.uuid_to_len[uuid] = index_cnt
-        return slots
-
-    def _get_indexes(self, uuid):
-        if uuid in self.uuid_to_pages: return []
-        return self.uuid_to_pages[uuid]
+    
+    def get_free_blocks(self, block_cnt=1):
+        blocks = [self.free_slots.popleft() for _ in range(block_cnt)]
+        self.free_slots_cnt -= block_cnt
+        return blocks
 
     def _free_blocks(self, uuid):
-        if uuid in self.uuid_to_pages:
-            block_idxs = self.uuid_to_pages.pop(uuid)
-            len = self.uuid_to_len.pop(uuid)
-            self.free_slots_cnt += len
-            self.free_slots += block_idxs
+        if uuid in self.uuids:
+            uuid_state =self.uuids[uuid]
+            self.free_slots += uuid_state.commited_blocks + [uuid_state.write_block]
+            self.free_slots_cnt += uuid_state.blocks_cnt
+            self.uuids.pop(uuid)
 
-    def _get_pages_and_meta(self, uuid):
-        pages_K = []
-        pages_V = []
-        for idx in self.uuid_to_pages[uuid]:
-            pages_K += [self.K[idx]]
-            pages_V += [self.V[idx]]
-        return pages_K, pages_V, self.uuid_to_len[uuid]
-    
+    def _get_pages(self, indexes):
+        K_ = [self.K[ind] for ind in indexes]
+        V_ = [self.V[ind] for ind in indexes]
+        return K_, V_
+
     def prefill(self, uuids, K, V, mask):
-        for i, uuid in enumerate(self, uuid):
-            seq_len = int(mask[i].sum().item())
-            self._get_indexes(uuid, seq_len)
-            pages_K, pages_V, _ = self._get_pages_and_meta(uuid)
-            for j in range(seq_len):
-                pages_K[j] = K[i][j]
-                pages_V[j] = V[i][j]
-    
-    def append_and_fetch(self, uuids, K, V):
-        K_ = []
-        V_ = []
-        q_positions = []
-        lengths = []
-        lengths = []
-        max_len = 0
         for i, uuid in enumerate(uuids):
-            self._get_new_indexes(uuid)
-            K_cached, V_cached, len = self._get_pages_and_meta(uuid)
-            K_cached[-1] = K[i]
-            V_cached[-1] = V[i]
+            seq_len = int(mask[i].sum().item())
+            blocks_cnt = (seq_len + self.block_size - 1) // self.block_size
+            # preallocate new block for write if we hit exact multiply of block size
+            if seq_len == blocks_cnt * self.block_size:
+                blocks_cnt +=1
+            indexes = self.get_free_blocks(blocks_cnt)
+            pages_K, pages_V = self._get_pages(indexes)
+            for j in range(seq_len):
+                block_idx = j // self.block_size
+                in_block_idx = j % self.block_size
+                pages_K[block_idx][in_block_idx] = K[i][j]
+                pages_V[block_idx][in_block_idx] = V[i][j]
+
+            uuid_state = self.UUIDState(self, self.block_size, blocks_cnt, indexes[:-1], indexes[-1], seq_len % self.block_size)
+            self.uuids[uuid] = uuid_state
+
+    def append_and_fetch(self, uuids, K, V):
+        max_len = 0
+        batch_size = 0
+        lengths = []
+        for i, uuid in enumerate(uuids):
+            uuid_state = self.uuids[uuid]
+            uuid_state.insert_single(K[i], V[i])
+            len = (uuid_state.blocks_count - 1) * self.block_size + uuid_state.write_block_occupancy
             max_len = max(max_len, len)
-            K_i = torch.tensor((len, self.d_model), device=self.device, dtype=self.dtype)
-            V_i = torch.tensor((len, self.d_model), device=self.device, dtype=self.dtype)
-            for j in range(len):
-                K_i[j] = K_cached[j]
-                V_i[j] = V_cached[j]
+            lengths += [len]
+            batch_size +=1
         
-        kv_mask = []
-        k_positions = []
-        for uuid, seq_len in zip(uuids, lengths):
-            slot = self.uuid_to_slot[uuid]
-            K_ += [self.K[slot, :max_len]]
-            V_ += [self.V[slot, :max_len]]
-            kv_mask += [torch.arange(max_len, device=K.device) < seq_len]
-            k_positions += [torch.arange(max_len, device=K.device, dtype=torch.long)]
+        K = torch.zeros((batch_size, max_len, self.d_model), device=self.device, dtype=self.dtype)
+        V = torch.zeros((batch_size, max_len, self.d_model), device=self.device, dtype=self.dtype)
+        for i, uuid in enumerate(uuids):
+            uuid_state = self.uuids[uuid]
+            uuid_state.fill(K[i], V[i])
 
-        return (
-            torch.stack(K_),
-            torch.stack(V_),
-            torch.tensor(q_positions, device=K.device, dtype=torch.long).unsqueeze(1),
-            torch.stack(k_positions),
-            torch.stack(kv_mask),
-        )
-
+        mask = torch.arange(max_len).expand(len(lengths), max_len) < lengths.unsqueeze(1)
+        return K, V, mask
+    
     def release(self, uuids):
         for uuid in uuids:
             self._free_blocks(uuid)
