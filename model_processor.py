@@ -235,8 +235,11 @@ class ModelProcessor:
                     batch = self.prefill_waiting[: self.max_batch_prefill]
                     self.prefill_waiting = self.prefill_waiting[self.max_batch_prefill :]
                 else:
+                    can_accepnt_cnt = self._get_max_available_occupancy_left()
+                    if can_accepnt_cnt == 0:
+                        continue
                     op = OP.GENERATE
-                    batch = self.generating[: self.max_batch_generate]
+                    batch = self.generating[: min(self.max_batch_generate, can_accepnt_cnt)]
 
             if op == OP.GENERATE:
                 full = [handle for handle in batch if handle.cache_len >= self.max_request_len]
@@ -298,6 +301,19 @@ class ModelProcessor:
                 ).squeeze(0)
             tokens.append(token)
         return torch.stack(tokens)
+
+    def _get_max_available_occupancy_left(self):
+        occupancy_info = self.kv_caches[0].get_occupancy_info()
+        blocks_cnt = occupancy_info["blocks_cnt"]
+        block_size = occupancy_info["block_size"]
+        free_blocks = occupancy_info["free_blocks"]
+        uuid_cnt = occupancy_info["uuid_cnt"]
+
+        max_blocks_per_query = (self.max_request_len + block_size - 1) // block_size
+        current_reserved_space = max_blocks_per_query * uuid_cnt
+
+        return (blocks_cnt - current_reserved_space) // max_blocks_per_query
+
 
     def _release_caches(self, handle_id: int):
         for cache in self.kv_caches:

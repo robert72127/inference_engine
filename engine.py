@@ -34,7 +34,9 @@ class Engine:
     ):
         # detect backend and init
         self.backend = backend if backend.is_available() else BACKEND.CPU
+        # todo calculate memory and create partial constructor
         self.model = model
+        
         self.model_workers_cnt = self.backend.get_device_count(max_workers)
 
         module = importlib.import_module(f"models.{models[model]['module']}")
@@ -80,7 +82,7 @@ class Engine:
         backend = self.schedule()
         Logger.debug("Scheduled request prompt_tokens=%d max_tokens=%d", tokens.size(0), max_tokens)
 
-        handle = await backend.prefill(tokens, temperature=temperature, top_p=top_p)
+        handle = await backend.prefill(tokens, temperature=temperature, top_p=top_p, max_new_tokens=max_tokens)
 
         for _ in range(max_tokens):
             tok = await backend.next_token(handle)

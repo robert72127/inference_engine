@@ -135,9 +135,15 @@ def parse_model(
     model_dir: Path,
     cfg: ModelConfig,
     device: torch.device,
-    cache_max_requests: int,
-    cache_max_seq_len: int,
+    memory_available: int, # either as total mem per gpu or some heuristics for cpu based on worker cnt
 ):
+    # todo calculate space occupied by model, and input
+    # calculate amount of attention_layer
+    # then calculate how much space we can assign to each cache
+    # based on d_model calculate block_size
+    cache_block_size = 0
+    cache_blocks_cnt = 0
+
     tensors = load_file(model_dir, device=str(device))
 
     hidden_layers = {}
@@ -194,8 +200,8 @@ def parse_model(
                         cfg.max_seq_len,
                         cfg.rope_theta,
                         rope,
-                        cache_max_requests,
-                        cache_max_seq_len,
+                        cache_blocks_cnt,
+                        cache_block_size,
                     )
                     kv_caches.append(self_attn.KV_cache)
                 case _: raise Exception("Unknown layer, aborting")
@@ -213,7 +219,6 @@ class Qwen2_5_0_5B_Instruct(Model):
         self,
         device: torch.device,
         cache_max_requests: int,
-        cache_max_seq_len: int,
     ):
         model_file = model_dir / "model.safetensors"
         config = model_dir / "config.json"
@@ -226,7 +231,6 @@ class Qwen2_5_0_5B_Instruct(Model):
             model_cfg,
             self.device,
             cache_max_requests=cache_max_requests,
-            cache_max_seq_len=cache_max_seq_len,
         )
   
     @torch.inference_mode()
