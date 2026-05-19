@@ -2,11 +2,11 @@ from huggingface_hub import snapshot_download
 from safetensors.torch import load_file
 
 import json
-from pathlib import Path
 import os
-import sys
+from pathlib import Path
 
 from models.model import Model
+from kvcache import blocks_for_tokens
 from layers.layers import (
     Embedding,
     RMSNorm,
@@ -20,10 +20,9 @@ from layers.layers import (
 
 import torch
 
-from transformers import AutoTokenizer, AutoModelForCausalLM
-
 repo_id = "Qwen/Qwen2.5-0.5B-Instruct"
 model_dir = Path(snapshot_download(repo_id=repo_id))  # user-agnostic
+CACHE_BLOCK_SIZE = 256
 
 def get_model_dir():
     return model_dir
@@ -31,14 +30,8 @@ def get_model_dir():
 config = model_dir / "config.json"
 model_file = model_dir / "model.safetensors"
 
-print(model_dir)
-
-print(config)
-
 with open(config, "r") as f:
     cfg = json.load(f)
-
-print(cfg)
 
 def print_model():
     model = model_dir / "model.safetensors"
@@ -66,6 +59,10 @@ class ModelConfig:
         self.rope_theta = cfg['rope_theta']
         self.max_seq_len = cfg['sliding_window']
 
+    @property
+    def dtype_size(self):
+        return torch.empty((), dtype=self.dtype).element_size()
+
 def parse_mlp(mlp_tensors):
     down_weights = gate_weights = up_weights = None
     
@@ -86,10 +83,9 @@ def parse_attn(
     num_kv_heads,
     num_attn_heads,
     max_seq_len,
-    rope_theta,
     rope,
-    cache_max_requests,
-    cache_max_seq_len,
+    cache_blocks_cnt,
+    cache_block_size,
 ):
     k_proj_bias = k_proj_weight = None
     v_proj_bias = v_proj_weight = None
@@ -126,25 +122,51 @@ def parse_attn(
         k_weights=k_proj_weight, k_bias=k_proj_bias,
         v_weights=v_proj_weight, v_bias=v_proj_bias,
         out_proj_weights=o_proj_weight, out_proj_bias=o_proj_bias,
-        cache_max_requests=cache_max_requests,
-        cache_max_seq_len=cache_max_seq_len,
+        cache_blocks_cnt=cache_blocks_cnt,
+        cache_block_size=cache_block_size,
     )
+
+def cache_blocks_cnt_from_budget(
+    cfg: ModelConfig,
+    tensors: dict[str, torch.Tensor],
+    cache_block_size: int,
+    cache_max_requests: int,
+    cache_max_seq_len: int,
+    memory_available: int,
+):
+    max_blocks_cnt = cache_max_requests * blocks_for_tokens(cache_max_seq_len, cache_block_size)
+    model_bytes = sum(arr.numel() * arr.element_size() for arr in tensors.values())
+    input_bytes = cache_max_seq_len * cfg.hidden_size * cfg.dtype_size
+    memory_left = memory_available - model_bytes - input_bytes
+    kv_dim = cfg.hidden_size * cfg.n_kv_heads // cfg.n_attn_heads
+    bytes_per_block = 2 * cfg.n_layers * cache_block_size * kv_dim * cfg.dtype_size
+    if bytes_per_block <= 0:
+        raise RuntimeError("Invalid cache block geometry")
+    if memory_left <= 0:
+        raise RuntimeError("Not enough memory left for KV cache")
+    return min(max_blocks_cnt, memory_left // bytes_per_block)
 
 # generates tensor processing graph from safetensor
 def parse_model(
     model_dir: Path,
     cfg: ModelConfig,
     device: torch.device,
-    memory_available: int, # either as total mem per gpu or some heuristics for cpu based on worker cnt
+    cache_max_requests: int,
+    cache_max_seq_len: int,
+    memory_available: int,
 ):
-    # todo calculate space occupied by model, and input
-    # calculate amount of attention_layer
-    # then calculate how much space we can assign to each cache
-    # based on d_model calculate block_size
-    cache_block_size = 0
-    cache_blocks_cnt = 0
-
+    cache_block_size = CACHE_BLOCK_SIZE
     tensors = load_file(model_dir, device=str(device))
+    cache_blocks_cnt = cache_blocks_cnt_from_budget(
+        cfg,
+        tensors,
+        cache_block_size,
+        cache_max_requests,
+        cache_max_seq_len,
+        memory_available,
+    )
+    if cache_blocks_cnt == 0:
+        raise RuntimeError("KV cache budget allows zero cache blocks")
 
     hidden_layers = {}
     model = []
@@ -198,7 +220,6 @@ def parse_model(
                         cfg.n_kv_heads,
                         cfg.n_attn_heads,
                         cfg.max_seq_len,
-                        cfg.rope_theta,
                         rope,
                         cache_blocks_cnt,
                         cache_block_size,
@@ -219,6 +240,8 @@ class Qwen2_5_0_5B_Instruct(Model):
         self,
         device: torch.device,
         cache_max_requests: int,
+        cache_max_seq_len: int,
+        memory_available: int,
     ):
         model_file = model_dir / "model.safetensors"
         config = model_dir / "config.json"
@@ -231,6 +254,8 @@ class Qwen2_5_0_5B_Instruct(Model):
             model_cfg,
             self.device,
             cache_max_requests=cache_max_requests,
+            cache_max_seq_len=cache_max_seq_len,
+            memory_available=memory_available,
         )
   
     @torch.inference_mode()
@@ -243,5 +268,13 @@ class Qwen2_5_0_5B_Instruct(Model):
         return out
 
 if __name__ == '__main__':
-    model = Qwen2_5_0_5B_Instruct(torch.device("cpu"), cache_max_requests=100, cache_max_seq_len=4096)
+    pages = os.sysconf("SC_PHYS_PAGES")
+    page_size = os.sysconf("SC_PAGE_SIZE")
+    memory_available = pages * page_size
+    model = Qwen2_5_0_5B_Instruct(
+        torch.device("cpu"),
+        cache_max_requests=100,
+        cache_max_seq_len=4096,
+        memory_available=memory_available,
+    )
     print_model()

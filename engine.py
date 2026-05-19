@@ -9,6 +9,8 @@ from tokenizer import Tokenizer
 from model_processor import ModelProcessor
 from models import MODEL, models
 
+CPU_SYSTEM_RESERVE_GB = 4
+
 class BACKEND(Enum):
     CPU = "cpu"
     CUDA = "cuda"
@@ -34,7 +36,6 @@ class Engine:
     ):
         # detect backend and init
         self.backend = backend if backend.is_available() else BACKEND.CPU
-        # todo calculate memory and create partial constructor
         self.model = model
         
         self.model_workers_cnt = self.backend.get_device_count(max_workers)
@@ -42,7 +43,13 @@ class Engine:
         module = importlib.import_module(f"models.{models[model]['module']}")
         model_dir = module.get_model_dir() 
         model_constructor = getattr(module, models[model]['constructor'])
-        model_factory = partial(model_constructor, cache_max_requests=max_proc_req, cache_max_seq_len=max_cache_seq_len,)
+        model_memory_available = self.get_model_memory_available()
+        model_factory = partial(
+            model_constructor,
+            cache_max_requests=max_proc_req,
+            cache_max_seq_len=max_cache_seq_len,
+            memory_available=model_memory_available,
+        )
 
         Logger.info(f"Launching tokenizer server for model : {self.model.value}")
         self.tokenizer =  Tokenizer(model_dir=model_dir)
@@ -59,6 +66,20 @@ class Engine:
         ]
 
         self.next_worker = 0
+
+    def get_model_memory_available(self):
+        match self.backend:
+            case BACKEND.CPU:
+                pages = os.sysconf("SC_PHYS_PAGES")
+                page_size = os.sysconf("SC_PAGE_SIZE")
+                total_memory = pages * page_size
+                reserve = CPU_SYSTEM_RESERVE_GB * 1024**3
+                return max(0, total_memory - reserve) // self.model_workers_cnt
+            case BACKEND.CUDA:
+                return min(
+                    torch.cuda.get_device_properties(worker_index).total_memory
+                    for worker_index in range(self.model_workers_cnt)
+                )
 
     def apply_prompt_template(self, prompt: str):
         return f"<|im_start|>system\nYou are a helpful assistant anser .<|im_end|>\n<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"

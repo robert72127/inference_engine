@@ -19,12 +19,21 @@ class OP(Enum):
     GENERATE = 2
 
 class ServerHandle:
-    def __init__(self, handle_id: int, tokens: torch.Tensor, temperature: float, top_p: float):
+    def __init__(
+        self,
+        handle_id: int,
+        tokens: torch.Tensor,
+        temperature: float,
+        top_p: float,
+        max_new_tokens: int,
+    ):
         self.id = handle_id
         self.tokens = tokens
         self.temperature = temperature
         self.top_p = top_p
         self.cache_len = int(tokens.size(0))
+        self.max_new_tokens = max_new_tokens
+        self.generated_tokens = 0
 
         #  previous token for generation.
         self.input_token: int | None = None
@@ -76,8 +85,22 @@ class RemoteModelProcessorHandle:
         )
         return await fut
 
-    async def prefill(self, tokens: torch.Tensor, temperature: float = 1.0, top_p: float = 1.0) -> RemoteHandle:
-        resp = await self.call("PREFILL", {"tokens": tokens.tolist(), "temperature": temperature, "top_p": top_p})
+    async def prefill(
+        self,
+        tokens: torch.Tensor,
+        temperature: float = 1.0,
+        top_p: float = 1.0,
+        max_new_tokens: int | None = None,
+    ) -> RemoteHandle:
+        resp = await self.call(
+            "PREFILL",
+            {
+                "tokens": tokens.tolist(),
+                "temperature": temperature,
+                "top_p": top_p,
+                "max_new_tokens": max_new_tokens,
+            },
+        )
         return RemoteHandle(id=resp["handle_id"])
 
     async def next_token(self, handle: RemoteHandle) -> int:
@@ -110,6 +133,7 @@ async def run_model_server(endpoint: str, processor: "ModelProcessor"):
                 payload["tokens"],
                 temperature=payload.get("temperature", 1.0),
                 top_p=payload.get("top_p", 1.0),
+                max_new_tokens=payload.get("max_new_tokens"),
             )
 
         elif op == "NEXT_TOKEN":result = await processor.next_token(payload["handle_id"])
@@ -163,22 +187,40 @@ class ModelProcessor:
         )
         self.worker.start()
 
-    async def prefill(self, tokens: list[int], temperature: float = 1.0, top_p: float = 1.0):
+    async def prefill(
+        self,
+        tokens: list[int],
+        temperature: float = 1.0,
+        top_p: float = 1.0,
+        max_new_tokens: int | None = None,
+    ):
         if isinstance(tokens, torch.Tensor):
             tokens_t = tokens.detach().clone().to(device=self.device, dtype=torch.long)
         else:
             tokens_t = torch.tensor(tokens, device=self.device, dtype=torch.long)
 
-        if tokens_t.size(0) > self.max_request_len:
+        prompt_len = int(tokens_t.size(0))
+        if prompt_len > self.max_request_len:
             raise RuntimeError(
-                f"Prompt length {tokens_t.size(0)} exceeds KV cache capacity {self.max_request_len}"
+                f"Prompt length {prompt_len} exceeds KV cache capacity {self.max_request_len}"
             )
+        allowed_new_tokens = self.max_request_len - prompt_len
+        if max_new_tokens is None:
+            max_new_tokens = allowed_new_tokens
+        else:
+            max_new_tokens = min(max_new_tokens, allowed_new_tokens)
 
         with self.cv:
             handle_id = self.next_handle_id
             self.next_handle_id += 1
 
-            handle = ServerHandle(handle_id, tokens_t, temperature=temperature, top_p=top_p)
+            handle = ServerHandle(
+                handle_id,
+                tokens_t,
+                temperature=temperature,
+                top_p=top_p,
+                max_new_tokens=max_new_tokens,
+            )
             self.handles[handle_id] = handle
             self.prefill_waiting.append(handle)
 
@@ -198,8 +240,11 @@ class ModelProcessor:
 
     async def release(self, handle_id: int):
         with self.cv:
-            self.handles.pop(handle_id, None)
+            handle = self.handles.pop(handle_id, None)
             self.prefill_waiting = [h for h in self.prefill_waiting if h.id != handle_id]
+            self.generating = [h for h in self.generating if h.id != handle_id]
+            if handle is not None:
+                self._release_caches(handle.id)
             self.cv.notify()
 
     def _make_batch(self, batch: list[ServerHandle], op: OP):
@@ -231,18 +276,31 @@ class ModelProcessor:
                 self.cv.wait_for(lambda: self.prefill_waiting or self.generating)
 
                 if self.prefill_waiting and (next_op == OP.PREFILL or not self.generating):
+                    available_slots = self._get_max_available_occupancy_left()
+                    if available_slots == 0:
+                        if not self.generating:
+                            continue
+                        next_op = OP.GENERATE
+                        continue
                     op = OP.PREFILL
-                    batch = self.prefill_waiting[: self.max_batch_prefill]
-                    self.prefill_waiting = self.prefill_waiting[self.max_batch_prefill :]
+                    batch_size = min(self.max_batch_prefill, available_slots)
+                    batch = self.prefill_waiting[:batch_size]
+                    self.prefill_waiting = self.prefill_waiting[batch_size:]
                 else:
-                    can_accepnt_cnt = self._get_max_available_occupancy_left()
-                    if can_accepnt_cnt == 0:
+                    max_batch_size = self._get_max_generate_batch_size()
+                    if max_batch_size == 0:
+                        next_op = OP.PREFILL
                         continue
                     op = OP.GENERATE
-                    batch = self.generating[: min(self.max_batch_generate, can_accepnt_cnt)]
+                    batch = self.generating[:max_batch_size]
 
             if op == OP.GENERATE:
-                full = [handle for handle in batch if handle.cache_len >= self.max_request_len]
+                full = [
+                    handle
+                    for handle in batch
+                    if handle.cache_len >= self.max_request_len
+                    or handle.generated_tokens >= handle.max_new_tokens
+                ]
                 if full:
                     with self.cv:
                         for handle in full:
@@ -251,7 +309,12 @@ class ModelProcessor:
                             self.handles.pop(handle.id, None)
                             self._release_caches(handle.id)
                             handle.token_q.put_nowait(self.eos_token_id)
-                    batch = [handle for handle in batch if handle.cache_len < self.max_request_len]
+                    batch = [
+                        handle
+                        for handle in batch
+                        if handle.cache_len < self.max_request_len
+                        and handle.generated_tokens < handle.max_new_tokens
+                    ]
                     if not batch:
                         next_op = OP.PREFILL
                         continue
@@ -268,6 +331,7 @@ class ModelProcessor:
                     released = handle.id not in self.handles
                     if op == OP.GENERATE:
                         handle.cache_len += 1
+                        handle.generated_tokens += 1
                     handle.input_token = tok
                     if tok == self.eos_token_id or released:
                         handle.finished = True
@@ -303,18 +367,21 @@ class ModelProcessor:
         return torch.stack(tokens)
 
     def _get_max_available_occupancy_left(self):
+        if not self.kv_caches:
+            return 0
         occupancy_info = self.kv_caches[0].get_occupancy_info()
-        blocks_cnt = occupancy_info["blocks_cnt"]
-        block_size = occupancy_info["block_size"]
-        free_blocks = occupancy_info["free_blocks"]
-        uuid_cnt = occupancy_info["uuid_cnt"]
+        max_blocks_per_request = self.kv_caches[0].blocks_for_tokens(self.max_request_len)
+        return max(
+            0,
+            (occupancy_info["blocks_cnt"] - max_blocks_per_request * occupancy_info["uuid_cnt"])
+            // max_blocks_per_request,
+        )
 
-        max_blocks_per_query = (self.max_request_len + block_size - 1) // block_size
-        current_reserved_space = max_blocks_per_query * uuid_cnt
-
-        return (blocks_cnt - current_reserved_space) // max_blocks_per_query
-
+    def _get_max_generate_batch_size(self):
+        if not self.generating:
+            return 0
+        return min(self.max_batch_generate, len(self.generating))
 
     def _release_caches(self, handle_id: int):
         for cache in self.kv_caches:
-            cache.release(handle_id)
+            cache.release((handle_id,))

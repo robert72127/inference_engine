@@ -1,8 +1,13 @@
 from collections import deque
 import torch
 
-class PagedKVCache:
+def blocks_for_tokens(token_count: int, block_size: int):
+    blocks_cnt = (token_count + block_size - 1) // block_size
+    if token_count > 0 and token_count % block_size == 0:
+        blocks_cnt += 1
+    return blocks_cnt
 
+class PagedKVCache:
     class UUIDState:
         def __init__(self, 
                     kv_cache,
@@ -32,15 +37,18 @@ class PagedKVCache:
             self.write_block_occupancy+=1
 
         def fill(self, K, V):
-            i = 0
-            for blck in self.commited_blocks:
-                for j in range(self.block_size):
-                    K[i * self.block_size + j] = self.kv_cache.K[blck][j]
-                    V[i * self.block_size + j] = self.kv_cache.V[blck][j]
-                    i+= 1
+            block_offset = 0
+            for block in self.commited_blocks:
+                start = block_offset * self.block_size
+                end = start + self.block_size
+                K[start:end] = self.kv_cache.K[block]
+                V[start:end] = self.kv_cache.V[block]
+                block_offset += 1
+
+            start = block_offset * self.block_size
             for j in range(self.write_block_occupancy):
-                K[i * self.block_size + j] = self.kv_cache.K[self.write_block][j]
-                V[i * self.block_size + j] = self.kv_cache.V[self.write_block][j]
+                K[start + j] = self.kv_cache.K[self.write_block][j]
+                V[start + j] = self.kv_cache.V[self.write_block][j]
 
     def __init__(self, d_model, num_blocks, block_size, device, dtype):
         self.d_model = d_model
@@ -64,7 +72,7 @@ class PagedKVCache:
             "block_size":  self.block_size, 
             "free_blocks": self.free_slots_cnt, 
             "uuid_cnt":    len(self.uuids)}
-    
+
     def get_free_blocks(self, block_cnt=1):
         blocks = [self.free_slots.popleft() for _ in range(block_cnt)]
         self.free_slots_cnt -= block_cnt
@@ -74,7 +82,7 @@ class PagedKVCache:
         if uuid in self.uuids:
             uuid_state =self.uuids[uuid]
             self.free_slots += uuid_state.commited_blocks + [uuid_state.write_block]
-            self.free_slots_cnt += uuid_state.blocks_cnt
+            self.free_slots_cnt += uuid_state.blocks_count
             self.uuids.pop(uuid)
 
     def _get_pages(self, indexes):
@@ -85,10 +93,7 @@ class PagedKVCache:
     def prefill(self, uuids, K, V, mask):
         for i, uuid in enumerate(uuids):
             seq_len = int(mask[i].sum().item())
-            blocks_cnt = (seq_len + self.block_size - 1) // self.block_size
-            # preallocate new block for write if we hit exact multiply of block size
-            if seq_len == blocks_cnt * self.block_size:
-                blocks_cnt +=1
+            blocks_cnt = blocks_for_tokens(seq_len, self.block_size)
             indexes = self.get_free_blocks(blocks_cnt)
             pages_K, pages_V = self._get_pages(indexes)
             for j in range(seq_len):
@@ -106,11 +111,11 @@ class PagedKVCache:
         lengths = []
         for i, uuid in enumerate(uuids):
             uuid_state = self.uuids[uuid]
-            uuid_state.insert_single(K[i], V[i])
-            len = (uuid_state.blocks_count - 1) * self.block_size + uuid_state.write_block_occupancy
-            max_len = max(max_len, len)
-            lengths += [len]
-            batch_size +=1
+            uuid_state.insert_single(K[i, 0], V[i, 0])
+            length = (uuid_state.blocks_count - 1) * self.block_size + uuid_state.write_block_occupancy
+            max_len = max(max_len, length)
+            lengths.append(length)
+            batch_size += 1
         
         K = torch.zeros((batch_size, max_len, self.d_model), device=self.device, dtype=self.dtype)
         V = torch.zeros((batch_size, max_len, self.d_model), device=self.device, dtype=self.dtype)
@@ -131,11 +136,7 @@ class PagedKVCache:
             .expand(batch_size, max_len)
         )
 
-        q_positions = torch.tensor(
-            q_positions,
-            device=self.device,
-            dtype=torch.long,
-        ).unsqueeze(1)
+        q_positions = (lengths_t - 1).unsqueeze(1)
         
         return K, V, q_positions, k_positions, kv_mask
 
