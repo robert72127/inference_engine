@@ -2,7 +2,7 @@ from einops import rearrange
 import torch
 import math
 
-from kvcache import KVCache
+from kvcache import PagedKVCache
 
 class Embedding:
     def __init__(self, weights:torch.Tensor):
@@ -73,8 +73,9 @@ class MultiQueryAttention:
                  k_weights, k_bias,
                  v_weights, v_bias,
                  out_proj_weights, out_proj_bias,
-                 cache_max_requests=100,
-                 cache_max_seq_len=4096):
+                 cache_blocks_cnt,
+                 cache_block_size,
+                ):
         q_out_shape, _ = q_weights.shape
         kv_out_shape, _ = k_weights.shape
         self.num_kv_heads = num_kv_heads
@@ -82,10 +83,10 @@ class MultiQueryAttention:
         self.rope = rope
         self.head_dim = q_out_shape // self.num_attn_heads
         self.max_seq_len = max_seq_len
-        self.KV_cache = KVCache(
+        self.KV_cache = PagedKVCache(
             d_model=kv_out_shape,
-            max_requests=cache_max_requests,
-            max_request_len=cache_max_seq_len,
+            num_blocks = cache_blocks_cnt,
+            block_size = cache_block_size,
             device=q_weights.device,
             dtype=q_weights.dtype,
         )
@@ -206,3 +207,5 @@ class TransformerBlock:
         mlp_in = self.post_norm(x)
         return  x + self.mlp(mlp_in)
 
+# todo modify model processor to admit reject new requests based on usage of cache
+# before admiting new req: needed_blocks = ceil((prompt_len + max_new_tokens) / block_size)
