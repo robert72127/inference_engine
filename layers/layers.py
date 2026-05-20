@@ -157,21 +157,25 @@ class MultiQueryAttention:
             out = out * mask[..., None].to(out.dtype)
         return out
 
-
     def _generate(self, x:torch.Tensor, uuid=None):
+        # this is all single block
         Q = self.q_weights(x)
         K = self.k_weights(x)
         V = self.v_weights(x)
         Q = Q + self.q_bias if self.q_bias is not None else Q
         K = K + self.k_bias if self.k_bias is not None else K
         V = V + self.v_bias if self.v_bias is not None else V
-        K, V, q_positions, k_positions, kv_mask = self.KV_cache.append_and_fetch(uuid, K, V)
+
+        # we store in cache after rearrange into heads, d_heads
         Qh = rearrange(Q, "b l (h d) -> b h l d", h=self.num_attn_heads)
         Kh = rearrange(K, "b l (h d) -> b h l d", h=self.num_kv_heads)
         Vh = rearrange(V, "b l (h d) -> b h l d", h=self.num_kv_heads)
+        K, V, q_positions, k_positions, kv_mask = self.KV_cache.append_and_fetch(uuid, K, V)
         if self.rope is not None:
             Qh = self.rope(Qh, position=q_positions)
             Kh = self.rope(Kh, position=k_positions)
+        
+        K, V, q_positions, k_positions, kv_mask = self.KV_cache.append_and_fetch(uuid, K, V)
 
         B, H_q, L, D = Qh.shape
         _, H_kv, _, _ = Kh.shape
@@ -193,6 +197,7 @@ class MultiQueryAttention:
         out_g = torch.matmul(attn, Vg)
         out_heads = rearrange(out_g, "b h_kv g l d -> b l (h_kv g d)")
         return self.outproj(out_heads)
+
 
 class TransformerBlock:
     def __init__(self, mlp, pre_norm, attention, post_norm):
