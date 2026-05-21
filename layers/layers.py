@@ -175,7 +175,11 @@ class MultiQueryAttention:
             Qh = self.rope(Qh, position=q_positions)
             Kh = self.rope(Kh, position=k_positions)
         
-        K, V, q_positions, k_positions, kv_mask = self.KV_cache.append_and_fetch(uuid, K, V)
+        # list of dict: K, V, len for each uuid
+        pages_and_meta = self.KV_cache.append_and_fetch(uuid, K, V)
+        
+        
+        #K, V, q_positions, k_positions, kv_mask = self.KV_cache.append_and_fetch(uuid, K, V)
 
         B, H_q, L, D = Qh.shape
         _, H_kv, _, _ = Kh.shape
@@ -183,21 +187,74 @@ class MultiQueryAttention:
         Qg = Qh.view(B, H_kv, group, L, D)
         Kg = Kh.unsqueeze(2)
         Vg = Vh.unsqueeze(2)
-        
+
+        # needs to be calculated block based, with mask applied 
         attn_scores = torch.matmul(Qg, Kg.transpose(-1, -2)) / math.sqrt(D)
         B, H_kv, G, L, _ = attn_scores.shape
-
         causal = torch.triu(torch.ones(L, L, device=attn_scores.device, dtype=torch.bool),diagonal=1,)
         attn_scores = attn_scores.masked_fill(causal, float("-inf"))
+        
+        # this no longer needs to be applied        
         if kv_mask is not None:
             kv_mask = kv_mask.to(device=attn_scores.device, dtype=torch.bool)
             key_padding = ~kv_mask[:, None, None, None, :]
             attn_scores = attn_scores.masked_fill(key_padding, float("-inf"))
+
+        # softmax applied
         attn = attn_scores.softmax(dim=-1)
+
+        # muliply V with attention matrix
         out_g = torch.matmul(attn, Vg)
+        # rearrange, this should be not blocked again
         out_heads = rearrange(out_g, "b h_kv g l d -> b l (h_kv g d)")
         return self.outproj(out_heads)
 
+
+def _generate(self, x:torch.Tensor, uuid=None):
+        # this is all single block
+        Q = self.q_weights(x)
+        K = self.k_weights(x)
+        V = self.v_weights(x)
+        Q = Q + self.q_bias if self.q_bias is not None else Q
+        K = K + self.k_bias if self.k_bias is not None else K
+        V = V + self.v_bias if self.v_bias is not None else V
+
+        # we store in cache after rearrange into heads, d_heads
+        Qh = rearrange(Q, "b l (h d) -> b h l d", h=self.num_attn_heads)
+        Kh = rearrange(K, "b l (h d) -> b h l d", h=self.num_kv_heads)
+        Vh = rearrange(V, "b l (h d) -> b h l d", h=self.num_kv_heads)
+        K, V, q_positions, k_positions, kv_mask = self.KV_cache.append_and_fetch(uuid, K, V)
+        if self.rope is not None:
+            Qh = self.rope(Qh, position=q_positions)
+            Kh = self.rope(Kh, position=k_positions)
+
+
+        # list of dict: K, V, len for each uuid
+        pages_and_meta = self.KV_cache.append_and_fetch(uuid, K, V)
+        
+        out = torch.zeros(x.shape[0], Q.shape, Q.dtype, device=Q.device)
+        for idx in pages_and_meta:
+            K_blocks = pages_and_meta[idx]["K"]
+            V_blocks = pages_and_meta[idx]["V"]
+            token_count = pages_and_meta[idx]["token_count"]
+            m_max = float("-inf")
+            l = 0
+            scale  = math.sqrt(self.head_dim)
+            acc = torch.zeros(self.d_head, self.head_dim, dtype=Qh.dtype, device=Qh.device)
+            for i, (k_block, v_block) in enumerate(zip(K_blocks, V_blocks)):
+                s = torch.einsum("h 1 d, h s d -> h 1 s", Qh, k_block) * scale
+
+                m_block = s.max(dim=-1).values
+                m_new = max(m_max, m_block)
+                old_rescale = torch.exp(m_max - m_block)
+                m_max = m_new
+                weight = torch.exp(s - m_max)
+                l = l * old_rescale + torch.sum(torch.exp(s - m_max), dim=-1)
+                acc += torch.einsum("h 1 s, h s d -> h d", weight, v_block)
+
+            out[idx] = acc / l[:, None]
+        out = rearrange(out, "b h d -> b d")
+        return self.outproj(out)
 
 class TransformerBlock:
     def __init__(self, mlp, pre_norm, attention, post_norm):
