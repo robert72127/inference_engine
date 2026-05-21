@@ -82,7 +82,7 @@ class Engine:
                 )
 
     def apply_prompt_template(self, prompt: str):
-        return f"<|im_start|>system\nYou are a helpful assistant anser .<|im_end|>\n<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
+        return f"<|im_start|>system\nYou are a helpful assistant answer .<|im_end|>\n<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
 
     def schedule(self):
         worker = self.workers[self.next_worker]
