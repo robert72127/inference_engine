@@ -35,6 +35,17 @@ class PagedKVCache:
                 "token_count":seq_len
             }
 
+        def insert_single(self, K,V):
+            if self.write_block_occupancy == self.kv_cache.block_size:
+               self.commited_blocks += [self.write_block]
+               self.write_block = self.kv_cache.get_free_blocks()[0]
+               self.write_block_occupancy = 0 
+               self.blocks_count +=1
+
+            self.kv_cache.K[self.write_block][:, self.write_block_occupancy, :] = K 
+            self.kv_cache.V[self.write_block][:, self.write_block_occupancy, :] = V 
+            self.write_block_occupancy+=1
+
         def fill(self, K, V):
             block_offset = 0
             for block in self.commited_blocks:
@@ -104,6 +115,13 @@ class PagedKVCache:
 
             uuid_state = self.UUIDState(self, self.block_size, blocks_cnt, indexes[:-1], indexes[-1], seq_len % self.block_size)
             self.uuids[uuid] = uuid_state
+
+    def get_q_position(self, uuids):
+        positions = []
+        for uuid in uuids:
+            uuid_state = self.uuids[uuid]
+            positions.append((uuid_state.blocks_count -1) * self.block_size + uuid_state.write_block_occupancy)
+        return torch.tensor(positions, device=self.K.device).unsqueeze(1)
 
     def append_and_fetch(self, uuids, K, V):
         max_len = 0
