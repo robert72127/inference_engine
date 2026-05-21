@@ -181,28 +181,40 @@ class MultiQueryAttention:
             # list of dict: K, V, len for each uuid
             pages_and_meta = self.KV_cache.append_and_fetch(uuid, Kh, Vh)
             
-            out = torch.zeros(x.shape, Q.dtype, device=Q.device)
+            out = torch.zeros(x.shape[0], self.num_attn_heads, self.head_dim, dtype=Q.dtype, device=Q.device)
             for idx in range(len(pages_and_meta)):
+                q = Qh[idx]
                 K_blocks = pages_and_meta[idx]["K"]
                 V_blocks = pages_and_meta[idx]["V"]
                 token_count = pages_and_meta[idx]["token_count"]
-                m_max = float("-inf")
-                l = 0
-                scale  = math.sqrt(self.head_dim)
-                acc = torch.zeros(self.num_kv_heads, self.head_dim, dtype=Qh.dtype, device=Qh.device)
+                m_max = torch.full((self.num_attn_heads,), float("-inf"), device=Q.device)
+                l = torch.zeros((self.num_attn_heads,), device=Q.device)
+                scale  = 1/ math.sqrt(self.head_dim)
+                acc = torch.zeros(self.num_attn_heads, self.head_dim, dtype=q.dtype, device=Qh.device)
                 for i, (k_block, v_block) in enumerate(zip(K_blocks, V_blocks)):
-                    s = torch.einsum("h 1 d, h s d -> h 1 s", Qh, k_block) * scale
+                    group_size = self.num_attn_heads // self.num_kv_heads
+
+                    kv_head_idx = torch.arange(
+                        self.num_attn_heads,
+                        device=q.device,
+                    ) // group_size
+
+                    k_block = k_block[kv_head_idx]
+                    v_block = v_block[kv_head_idx]
+                  
+                  
+                    s = torch.einsum("h 1 d, h s d -> h s", q, k_block) * scale
 
                     m_block = s.max(dim=-1).values
-                    m_new = max(m_max, m_block)
-                    old_rescale = torch.exp(m_max - m_block)
+                    m_new = torch.maximum(m_max, m_block)
+                    old_rescale = torch.exp(m_max - m_new)
                     m_max = m_new
-                    weight = torch.exp(s - m_max)
-                    l = l * old_rescale + torch.sum(torch.exp(s - m_max), dim=-1)
-                    acc += torch.einsum("h 1 s, h s d -> h d", weight, v_block)
+                    weight = torch.exp(s - m_max[:, None])
+                    l = l * old_rescale + torch.sum(weight, dim=-1)
+                    acc = acc * old_rescale[:, None] + torch.einsum("h s, h s d -> h d", weight, v_block)
 
                 out[idx] = acc / l[:, None]
-            out = rearrange(out, "b h d -> b d")
+            out = rearrange(out, "b h d -> b (h d)")
             return self.outproj(out)
 
 class TransformerBlock:
