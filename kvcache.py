@@ -25,6 +25,16 @@ class PagedKVCache:
             self.blocks_count = blocks_count
             self.write_block_occupancy = write_block_occupancy
 
+        def get_pages_and_meta(self):
+            K = [self.kv_cache.K[idx] for idx in self.commited_blocks] + [self.kv_cache.K[self.write_block]]
+            V = [self.kv_cache.V[idx] for idx in self.commited_blocks] + [self.kv_cache.V[self.write_block]]
+            seq_len = self.block_size * len(self.commited_blocks) + self.write_block_occupancy
+            return {
+                "K":K,
+                "V":V,
+                "token_count":seq_len
+            }
+
         def insert_single(self, K,V):
             if self.write_block_occupancy == self.kv_cache.block_size:
                self.commited_blocks += [self.write_block]
@@ -32,8 +42,8 @@ class PagedKVCache:
                self.write_block_occupancy = 0 
                self.blocks_count +=1
 
-            self.kv_cache.K[self.write_block][self.write_block_occupancy] = K 
-            self.kv_cache.V[self.write_block][self.write_block_occupancy] = V 
+            self.kv_cache.K[self.write_block][:, self.write_block_occupancy, :] = K 
+            self.kv_cache.V[self.write_block][:, self.write_block_occupancy, :] = V 
             self.write_block_occupancy+=1
 
         def fill(self, K, V):
@@ -41,17 +51,18 @@ class PagedKVCache:
             for block in self.commited_blocks:
                 start = block_offset * self.block_size
                 end = start + self.block_size
-                K[start:end] = self.kv_cache.K[block]
-                V[start:end] = self.kv_cache.V[block]
+                K[:, start:end, :] = self.kv_cache.K[block]
+                V[:, start:end, :] = self.kv_cache.V[block]
                 block_offset += 1
 
             start = block_offset * self.block_size
             for j in range(self.write_block_occupancy):
-                K[start + j] = self.kv_cache.K[self.write_block][j]
-                V[start + j] = self.kv_cache.V[self.write_block][j]
+                K[:, start + j, :] = self.kv_cache.K[self.write_block][:, j, :]
+                V[:, start + j, :] = self.kv_cache.V[self.write_block][:, j, :]
 
-    def __init__(self, d_model, num_blocks, block_size, device, dtype):
-        self.d_model = d_model
+    def __init__(self, d_head, head_cnt, num_blocks, block_size, device, dtype):
+        self.d_head = d_head
+        self.head_cnt = head_cnt
         self.blocks_cnt = num_blocks
         self.block_size = block_size
 
@@ -62,8 +73,8 @@ class PagedKVCache:
 
         self.device = device
         self.dtype = dtype
-        self.K = torch.zeros((num_blocks, block_size, d_model), device=device, dtype=dtype)
-        self.V = torch.zeros((num_blocks, block_size, d_model), device=device, dtype=dtype)
+        self.K = torch.zeros((num_blocks,self.head_cnt, block_size, self.d_head), device=device, dtype=dtype)
+        self.V = torch.zeros((num_blocks,self.head_cnt, block_size, self.d_head), device=device, dtype=dtype)
 
     # todo extract info from this in the engine
     def get_occupancy_info(self):
@@ -99,46 +110,33 @@ class PagedKVCache:
             for j in range(seq_len):
                 block_idx = j // self.block_size
                 in_block_idx = j % self.block_size
-                pages_K[block_idx][in_block_idx] = K[i][j]
-                pages_V[block_idx][in_block_idx] = V[i][j]
+                pages_K[block_idx][:, in_block_idx, :] = K[i, :, j, :]
+                pages_V[block_idx][:, in_block_idx, :] = V[i, :, j, :]
 
             uuid_state = self.UUIDState(self, self.block_size, blocks_cnt, indexes[:-1], indexes[-1], seq_len % self.block_size)
             self.uuids[uuid] = uuid_state
+
+    def get_q_position(self, uuids):
+        positions = []
+        for uuid in uuids:
+            uuid_state = self.uuids[uuid]
+            positions.append((uuid_state.blocks_count -1) * self.block_size + uuid_state.write_block_occupancy)
+        return torch.tensor(positions, device=self.K.device).unsqueeze(1)
 
     def append_and_fetch(self, uuids, K, V):
         max_len = 0
         batch_size = 0
         lengths = []
+        pages_and_meta = []
         for i, uuid in enumerate(uuids):
             uuid_state = self.uuids[uuid]
-            uuid_state.insert_single(K[i, 0], V[i, 0])
+            uuid_state.insert_single(K[i, :, 0, :], V[i, :, 0, :])
             length = (uuid_state.blocks_count - 1) * self.block_size + uuid_state.write_block_occupancy
             max_len = max(max_len, length)
             lengths.append(length)
             batch_size += 1
-        
-        K = torch.zeros((batch_size, max_len, self.d_model), device=self.device, dtype=self.dtype)
-        V = torch.zeros((batch_size, max_len, self.d_model), device=self.device, dtype=self.dtype)
-        for i, uuid in enumerate(uuids):
-            uuid_state = self.uuids[uuid]
-            uuid_state.fill(K[i], V[i])
-
-        lengths_t = torch.tensor(lengths, device=self.device, dtype=torch.long)
-
-        kv_mask = (
-            torch.arange(max_len, device=self.device)
-            .unsqueeze(0)
-            .expand(batch_size, max_len) < lengths_t.unsqueeze(1))
-
-        k_positions = (
-            torch.arange(max_len, device=self.device, dtype=torch.long)
-            .unsqueeze(0)
-            .expand(batch_size, max_len)
-        )
-
-        q_positions = (lengths_t - 1).unsqueeze(1)
-        
-        return K, V, q_positions, k_positions, kv_mask
+            pages_and_meta += [uuid_state.get_pages_and_meta()]
+        return pages_and_meta
 
     def release(self, uuids):
         for uuid in uuids:

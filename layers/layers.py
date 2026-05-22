@@ -84,7 +84,8 @@ class MultiQueryAttention:
         self.head_dim = q_out_shape // self.num_attn_heads
         self.max_seq_len = max_seq_len
         self.KV_cache = PagedKVCache(
-            d_model=kv_out_shape,
+            d_head=self.head_dim, 
+            head_cnt=self.num_kv_heads,
             num_blocks = cache_blocks_cnt,
             block_size = cache_block_size,
             device=q_weights.device,
@@ -111,8 +112,6 @@ class MultiQueryAttention:
         Q = Q + self.q_bias if self.q_bias is not None else Q
         K = K + self.k_bias if self.k_bias is not None else K
         V = V + self.v_bias if self.v_bias is not None else V
-        # prefills cache from given K,V
-        self.KV_cache.prefill(uuid, K, V, mask)
         
         Qh = rearrange(Q, "b l (h d) -> b h l d", h=self.num_attn_heads)
         Kh = rearrange(K, "b l (h d) -> b h l d", h=self.num_kv_heads)
@@ -123,6 +122,9 @@ class MultiQueryAttention:
             Qh = self.rope(Qh, position=positions)
             Kh = self.rope(Kh, position=positions)
 
+        # prefills cache from given K,V
+        self.KV_cache.prefill(uuid, Kh, Vh, mask)
+        
         B, H_q, L, D = Qh.shape
         _, H_kv, _, _ = Kh.shape
 
@@ -157,42 +159,70 @@ class MultiQueryAttention:
             out = out * mask[..., None].to(out.dtype)
         return out
 
-
-    def _generate(self, x:torch.Tensor, uuid=None):
+    def _generate(self, x:torch.Tensor, uuid):
         Q = self.q_weights(x)
         K = self.k_weights(x)
         V = self.v_weights(x)
         Q = Q + self.q_bias if self.q_bias is not None else Q
         K = K + self.k_bias if self.k_bias is not None else K
         V = V + self.v_bias if self.v_bias is not None else V
-        K, V, q_positions, k_positions, kv_mask = self.KV_cache.append_and_fetch(uuid, K, V)
+
         Qh = rearrange(Q, "b l (h d) -> b h l d", h=self.num_attn_heads)
         Kh = rearrange(K, "b l (h d) -> b h l d", h=self.num_kv_heads)
         Vh = rearrange(V, "b l (h d) -> b h l d", h=self.num_kv_heads)
+        q_positions = self.KV_cache.get_q_position(uuid)
         if self.rope is not None:
             Qh = self.rope(Qh, position=q_positions)
-            Kh = self.rope(Kh, position=k_positions)
+            Kh = self.rope(Kh, position=q_positions)
 
-        B, H_q, L, D = Qh.shape
-        _, H_kv, _, _ = Kh.shape
-        group = H_q // H_kv   # number of query heads per kv head
-        Qg = Qh.view(B, H_kv, group, L, D)
-        Kg = Kh.unsqueeze(2)
-        Vg = Vh.unsqueeze(2)
-        
-        attn_scores = torch.matmul(Qg, Kg.transpose(-1, -2)) / math.sqrt(D)
-        B, H_kv, G, L, _ = attn_scores.shape
+        pages_and_meta = self.KV_cache.append_and_fetch(uuid, Kh, Vh)
 
-        causal = torch.triu(torch.ones(L, L, device=attn_scores.device, dtype=torch.bool),diagonal=1,)
-        attn_scores = attn_scores.masked_fill(causal, float("-inf"))
-        if kv_mask is not None:
-            kv_mask = kv_mask.to(device=attn_scores.device, dtype=torch.bool)
-            key_padding = ~kv_mask[:, None, None, None, :]
-            attn_scores = attn_scores.masked_fill(key_padding, float("-inf"))
-        attn = attn_scores.softmax(dim=-1)
-        out_g = torch.matmul(attn, Vg)
-        out_heads = rearrange(out_g, "b h_kv g l d -> b l (h_kv g d)")
-        return self.outproj(out_heads)
+        out = torch.zeros(
+            x.shape[0],
+            self.num_attn_heads,
+            self.head_dim,
+            dtype=Q.dtype,
+            device=Q.device,
+        )
+        group_size = self.num_attn_heads // self.num_kv_heads
+        scale = 1 / math.sqrt(self.head_dim)
+        kv_head_idx = torch.arange(self.num_attn_heads, device=Q.device) // group_size
+
+        for idx, state in enumerate(pages_and_meta):
+            q = Qh[idx].squeeze(dim=1).to(torch.float32)
+            token_count = state["token_count"]
+            m_max = torch.full((self.num_attn_heads,), float("-inf"), device=Q.device)
+            l = torch.zeros((self.num_attn_heads,), device=Q.device)
+            acc = torch.zeros(
+                self.num_attn_heads,
+                self.head_dim,
+                dtype=torch.float32,
+                device=Qh.device,
+            )
+
+            tokens_seen = 0
+            for k_block, v_block in zip(state["K"], state["V"]):
+                valid_tokens = min(self.KV_cache.block_size, token_count - tokens_seen)
+                if valid_tokens <= 0:
+                    break
+
+                k_block = k_block[:, :valid_tokens, :][kv_head_idx].to(torch.float32)
+                v_block = v_block[:, :valid_tokens, :][kv_head_idx].to(torch.float32)
+                s = torch.einsum("h d, h s d -> h s", q, k_block) * scale
+
+                m_block = s.max(dim=-1).values
+                m_new = torch.maximum(m_max, m_block)
+                old_rescale = torch.exp(m_max - m_new)
+                m_max = m_new
+                weight = torch.exp(s - m_max[:, None])
+                l = l * old_rescale + torch.sum(weight, dim=-1)
+                acc = acc * old_rescale[:, None] + torch.einsum("h s, h s d -> h d", weight, v_block)
+                tokens_seen += valid_tokens
+
+            out[idx] = (acc / l[:, None]).to(out.dtype)
+
+        out = rearrange(out, "b h d -> b 1 (h d)")
+        return self.outproj(out)
 
 class TransformerBlock:
     def __init__(self, mlp, pre_norm, attention, post_norm):

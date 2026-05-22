@@ -13,6 +13,7 @@ import zmq.asyncio
 from torch.nn.utils.rnn import pad_sequence
 
 from sampling import top_k_top_p_sample
+from kvcache import blocks_for_tokens
 
 class OP(Enum):
     PREFILL = 1
@@ -319,6 +320,12 @@ class ModelProcessor:
                         next_op = OP.PREFILL
                         continue
 
+            with self.cv:
+                batch = [handle for handle in batch if handle.id in self.handles]
+                if not batch:
+                    next_op = OP.PREFILL if op == OP.GENERATE else OP.GENERATE
+                    continue
+
             with torch.inference_mode():
                 handle_ids, input_ids, mask = self._make_batch(batch, op)
                 request_key = tuple(handle_ids)
@@ -370,7 +377,7 @@ class ModelProcessor:
         if not self.kv_caches:
             return 0
         occupancy_info = self.kv_caches[0].get_occupancy_info()
-        max_blocks_per_request = self.kv_caches[0].blocks_for_tokens(self.max_request_len)
+        max_blocks_per_request = blocks_for_tokens(self.max_request_len, self.kv_caches[0].block_size)
         return max(
             0,
             (occupancy_info["blocks_cnt"] - max_blocks_per_request * occupancy_info["uuid_cnt"])
