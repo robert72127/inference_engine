@@ -75,7 +75,6 @@ class PagedKVCache:
         self.K = torch.zeros((num_blocks,self.head_cnt, block_size, self.d_head), device=device, dtype=dtype)
         self.V = torch.zeros((num_blocks,self.head_cnt, block_size, self.d_head), device=device, dtype=dtype)
 
-    # todo extract info from this in the engine
     def get_occupancy_info(self):
         return {
             "blocks_cnt":  self.blocks_cnt,

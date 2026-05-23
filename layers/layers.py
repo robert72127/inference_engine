@@ -208,58 +208,46 @@ class MultiQueryAttention:
                 num_kv_heads=self.num_kv_heads,
             )
 
-            out = rearrange(out, "b h d -> b 1 (h d)")
-            return self.outproj(out)
-
         else:
-            out = torch.zeros(
-                x.shape[0],
+            self._paged_mqa_cpu(pages_info, Qh, out)
+
+        out = rearrange(out, "b h d -> b 1 (h d)")
+        return self.outproj(out)
+    
+    def _paged_mqa_cpu(self, pages_info, Qh, out):
+        group_size = self.num_attn_heads // self.num_kv_heads
+        scale = 1 / math.sqrt(self.head_dim)
+        kv_head_idx = torch.arange(self.num_attn_heads, device=Q.device) // group_size
+
+        for idx, state in enumerate(pages_info):
+            q = Qh[idx].squeeze(dim=1).to(torch.float32)
+            token_count = state["token_count"]
+            m_max = torch.full((self.num_attn_heads,), float("-inf"), device=Q.device)
+            l = torch.zeros((self.num_attn_heads,), device=Q.device)
+            acc = torch.zeros(
                 self.num_attn_heads,
                 self.head_dim,
-                dtype=Q.dtype,
-                device=Q.device,
+                dtype=torch.float32,
+                device=Qh.device,
             )
-            group_size = self.num_attn_heads // self.num_kv_heads
-            scale = 1 / math.sqrt(self.head_dim)
-            kv_head_idx = torch.arange(self.num_attn_heads, device=Q.device) // group_size
-
-            for idx, state in enumerate(pages_info):
-                q = Qh[idx].squeeze(dim=1).to(torch.float32)
-                token_count = state["token_count"]
-                m_max = torch.full((self.num_attn_heads,), float("-inf"), device=Q.device)
-                l = torch.zeros((self.num_attn_heads,), device=Q.device)
-                acc = torch.zeros(
-                    self.num_attn_heads,
-                    self.head_dim,
-                    dtype=torch.float32,
-                    device=Qh.device,
-                )
-
-                tokens_seen = 0
-                K_pages,V_pages = self.KV_cache._get_pages(state["indexes"])
-                for k_block, v_block in zip(K_pages, V_pages):
-                    valid_tokens = min(self.KV_cache.block_size, token_count - tokens_seen)
-                    if valid_tokens <= 0:
-                        break
-
-                    k_block = k_block[:, :valid_tokens, :][kv_head_idx].to(torch.float32)
-                    v_block = v_block[:, :valid_tokens, :][kv_head_idx].to(torch.float32)
-                    s = torch.einsum("h d, h s d -> h s", q, k_block) * scale
-
-                    m_block = s.max(dim=-1).values
-                    m_new = torch.maximum(m_max, m_block)
-                    old_rescale = torch.exp(m_max - m_new)
-                    m_max = m_new
-                    weight = torch.exp(s - m_max[:, None])
-                    l = l * old_rescale + torch.sum(weight, dim=-1)
-                    acc = acc * old_rescale[:, None] + torch.einsum("h s, h s d -> h d", weight, v_block)
-                    tokens_seen += valid_tokens
-
-                out[idx] = (acc / l[:, None]).to(out.dtype)
-
-            out = rearrange(out, "b h d -> b 1 (h d)")
-            return self.outproj(out)
-
+            tokens_seen = 0
+            K_pages,V_pages = self.KV_cache._get_pages(state["indexes"])
+            for k_block, v_block in zip(K_pages, V_pages):
+                valid_tokens = min(self.KV_cache.block_size, token_count - tokens_seen)
+                if valid_tokens <= 0:
+                    break
+                k_block = k_block[:, :valid_tokens, :][kv_head_idx].to(torch.float32)
+                v_block = v_block[:, :valid_tokens, :][kv_head_idx].to(torch.float32)
+                s = torch.einsum("h d, h s d -> h s", q, k_block) * scale
+                m_block = s.max(dim=-1).values
+                m_new = torch.maximum(m_max, m_block)
+                old_rescale = torch.exp(m_max - m_new)
+                m_max = m_new
+                weight = torch.exp(s - m_max[:, None])
+                l = l * old_rescale + torch.sum(weight, dim=-1)
+                acc = acc * old_rescale[:, None] + torch.einsum("h s, h s d -> h d", weight, v_block)
+                tokens_seen += valid_tokens
+            out[idx] = (acc / l[:, None]).to(out.dtype)
 
 class TransformerBlock:
     def __init__(self, mlp, pre_norm, attention, post_norm):
