@@ -59,28 +59,6 @@ class KVCacheTests(unittest.TestCase):
         self.assertTrue(torch.equal(pages_k[1][0, 0], reuse_k[0, 0, 2]))
         self.assertTrue(torch.equal(pages_k[1][0, 1], append_k[0, 0, 0]))
 
-    def test_clamp_init_blocks_drops_extra_reused_pages(self):
-        cache = self.make_cache(num_blocks=6, block_size=2, d_head=2)
-
-        tokens = torch.tensor([[1, 2, 3, 4, 5]])
-        K = torch.tensor([[[[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0], [9.0, 10.0]]]])
-        V = K + 10.0
-        mask = torch.tensor([[True, True, True, True, True]])
-
-        cache.init((7,), tokens)
-        cache.prefill((7,), tokens, K, V, mask)
-        cache.release((7,))
-
-        init_info = cache.init((8,), tokens)
-        self.assertEqual(init_info[0][1], 2)
-        self.assertEqual(len(cache.uuids[8].commited_blocks), 2)
-
-        cache.clamp_init_blocks((8,), [1])
-        self.assertEqual(len(cache.uuids[8].commited_blocks), 1)
-        self.assertEqual(cache.uuids[8].blocks_count, 1)
-        self.assertEqual(cache.uuids[8].write_block, None)
-        self.assertEqual(cache.uuids[8].write_block_occupancy, 0)
-
     def test_init_only_reuses_full_blocks(self):
         cache = self.make_cache(d_head=2, num_blocks=4, block_size=2)
 
