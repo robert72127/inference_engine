@@ -86,6 +86,7 @@ def parse_attn(
     rope,
     cache_blocks_cnt,
     cache_block_size,
+    max_requests_per_uuid,
 ):
     k_proj_bias = k_proj_weight = None
     v_proj_bias = v_proj_weight = None
@@ -124,6 +125,7 @@ def parse_attn(
         out_proj_weights=o_proj_weight, out_proj_bias=o_proj_bias,
         cache_blocks_cnt=cache_blocks_cnt,
         cache_block_size=cache_block_size,
+        max_requests_per_uuid=max_requests_per_uuid,
     )
 
 def cache_blocks_cnt_from_budget(
@@ -156,6 +158,7 @@ def parse_model(
     memory_available: int,
 ):
     cache_block_size = CACHE_BLOCK_SIZE
+    max_requests_per_uuid = blocks_for_tokens(cache_max_seq_len, cache_block_size)
     tensors = load_file(model_dir, device=str(device))
     cache_blocks_cnt = cache_blocks_cnt_from_budget(
         cfg,
@@ -223,6 +226,7 @@ def parse_model(
                         rope,
                         cache_blocks_cnt,
                         cache_block_size,
+                        max_requests_per_uuid,
                     )
                     kv_caches.append(self_attn.KV_cache)
                 case _: raise Exception("Unknown layer, aborting")
@@ -259,12 +263,17 @@ class Qwen2_5_0_5B_Instruct(Model):
         )
   
     @torch.inference_mode()
-    def __call__(self, input, prefill, mask, uuid):
-        out = input.to(self.device)
+    def __call__(self, input, tokens, prefill, mask, uuid):
+        tokens = tokens.to(self.device)
         mask = None if mask is None else mask.to(self.device)
+        out = input.to(self.device)
         for layer in self.layers: 
             layer, is_transformer = layer
-            out = layer(out, prefill=prefill, mask=mask, uuid=uuid) if is_transformer else layer(out)
+            out = (
+                layer(out, tokens=tokens, prefill=prefill, mask=mask, uuid=uuid)
+                if is_transformer
+                else layer(out)
+            )
         return out
 
 if __name__ == '__main__':

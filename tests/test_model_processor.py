@@ -24,6 +24,9 @@ class FakeConcurrentModel:
                 "uuid_cnt": 0,
             }
 
+        def get_blocks_available(self):
+            return self.total_blocks
+
         def blocks_for_tokens(self, token_count):
             return (token_count + self.block_size - 1) // self.block_size
 
@@ -33,7 +36,7 @@ class FakeConcurrentModel:
         self.generate_calls = 0
         self.kv_caches = [self.FakeCache()]
 
-    def __call__(self, input_ids, prefill, mask, uuid):
+    def __call__(self, input_ids, tokens, prefill, mask, uuid):
         batch, seq_len = input_ids.shape
         logits = torch.full(
             (batch, seq_len, self.vocab_size),
@@ -176,10 +179,10 @@ class ModelProcessorConcurrencyTests(unittest.IsolatedAsyncioTestCase):
                 self.kv_caches = [self.FakeCache(total_blocks=3, block_size=2)]
                 self.prefill_batch_sizes = []
 
-            def __call__(self, input_ids, prefill, mask, uuid):
+            def __call__(self, input_ids, tokens, prefill, mask, uuid):
                 if prefill:
                     self.prefill_batch_sizes.append(input_ids.size(0))
-                logits = super().__call__(input_ids, prefill, mask, uuid)
+                logits = super().__call__(input_ids, tokens, prefill, mask, uuid)
                 if not prefill:
                     logits[:, :, :] = -1000.0
                     logits[:, :, 7] = 0.0

@@ -3,8 +3,8 @@ import torch
 from torch.nn.utils.rnn import pad_sequence
 import math
 
-from kvcache import PagedKVCache
-from triton_kernels import paged_mqa_decode
+from kvcache import RadixKVCache
+from layers.triton_kernels import paged_mqa_decode
 
 class Embedding:
     def __init__(self, weights:torch.Tensor):
@@ -77,6 +77,7 @@ class MultiQueryAttention:
                  out_proj_weights, out_proj_bias,
                  cache_blocks_cnt,
                  cache_block_size,
+                 max_requests_per_uuid,
                 ):
         q_out_shape, _ = q_weights.shape
         kv_out_shape, _ = k_weights.shape
@@ -85,11 +86,12 @@ class MultiQueryAttention:
         self.rope = rope
         self.head_dim = q_out_shape // self.num_attn_heads
         self.max_seq_len = max_seq_len
-        self.KV_cache = PagedKVCache(
+        self.KV_cache = RadixKVCache(
             d_head=self.head_dim, 
             head_cnt=self.num_kv_heads,
             num_blocks = cache_blocks_cnt,
             block_size = cache_block_size,
+            max_requests_per_uuid=max_requests_per_uuid,
             device=q_weights.device,
             dtype=q_weights.dtype,
         )
@@ -102,12 +104,11 @@ class MultiQueryAttention:
         self.k_bias = None if k_bias is None else k_bias
         self.v_bias = None if v_bias is None else v_bias
 
-    # todo fix this to properly operate on block ie directly writing on them etc
-    def __call__(self, x:torch.Tensor, prefill, mask, uuid):
-        if prefill: return self._prefill(x, mask, uuid)
-        else: return self._generate(x, uuid)
+    def __call__(self, x:torch.Tensor, tokens, prefill, mask, uuid):
+        if prefill: return self._prefill(x, tokens, mask, uuid)
+        else: return self._generate(x, tokens, uuid)
 
-    def _prefill(self, x:torch.Tensor, mask, uuid):
+    def _prefill(self, x:torch.Tensor, tokens, mask, uuid):
         Q = self.q_weights(x)
         K = self.k_weights(x)
         V = self.v_weights(x)
@@ -120,48 +121,53 @@ class MultiQueryAttention:
         Vh = rearrange(V, "b l (h d) -> b h l d", h=self.num_kv_heads)
 
         if self.rope is not None:
-            positions = torch.arange(Qh.size(2), device=Qh.device).unsqueeze(0).expand(Qh.size(0), -1)
-            Qh = self.rope(Qh, position=positions)
-            Kh = self.rope(Kh, position=positions)
+            Qh = self.rope(Qh)
+            Kh = self.rope(Kh)
 
-        # prefills cache from given K,V
-        self.KV_cache.prefill(uuid, Kh, Vh, mask)
-        
         B, H_q, L, D = Qh.shape
         _, H_kv, _, _ = Kh.shape
+        full_len = tokens.size(1)
+        if mask is None:
+            prompt_lens = torch.full((B,), full_len, device=tokens.device, dtype=torch.long)
+        else:
+            prompt_lens = mask.to(device=tokens.device, dtype=torch.bool).sum(dim=1)
+
+        prompt_tokens = [
+            tokens[idx, : int(prompt_lens[idx].item())]
+            for idx in range(B)
+        ]
+        self.KV_cache.init(uuid, prompt_tokens)
 
         group = H_q // H_kv   # number of query heads per kv head
-
-        Qg = Qh.view(B, H_kv, group, L, D)
-        Kg = Kh.unsqueeze(2)
-        Vg = Vh.unsqueeze(2)
-
-        attn_scores = torch.matmul(Qg, Kg.transpose(-1, -2)) / math.sqrt(D)
-        
-        B, H_kv, G, L, _ = attn_scores.shape
-
-        # [L, L] upper-triangular mask where j > i (future positions)
-        causal = torch.triu(
-            torch.ones(L, L, device=attn_scores.device, dtype=torch.bool),
-            diagonal=1,
+        out_heads = torch.zeros(
+            (B, H_q, L, D),
+            device=Qh.device,
+            dtype=torch.float32,
         )
-        
-        attn_scores = attn_scores.masked_fill(causal, float("-inf"))
-        if mask is not None:
-            mask = mask.to(device=attn_scores.device, dtype=torch.bool)
-            key_padding = ~mask[:, None, None, None, :]
-            attn_scores = attn_scores.masked_fill(key_padding, float("-inf"))
-        attn = attn_scores.softmax(dim=-1)
 
-        out_g = torch.matmul(attn, Vg)
+        for idx in range(B):
+            seq_len = int(prompt_lens[idx].item())
+            if seq_len <= 0:
+                continue
 
-        out_heads = rearrange(out_g, "b h_kv g l d -> b l (h_kv g d)")
-        out = self.outproj(out_heads)
-        if mask is not None:
-            out = out * mask[..., None].to(out.dtype)
+            Qg = Qh[idx : idx + 1, :, :seq_len, :].view(1, H_kv, group, seq_len, D)
+            Kg = Kh[idx : idx + 1, :, :seq_len, :].unsqueeze(2)
+            Vg = Vh[idx : idx + 1, :, :seq_len, :].unsqueeze(2)
+            attn_scores = torch.matmul(Qg, Kg.transpose(-1, -2)) / math.sqrt(D)
+            causal = torch.triu(
+                torch.ones(seq_len, seq_len, device=attn_scores.device, dtype=torch.bool),
+                diagonal=1,
+            )
+            attn_scores = attn_scores.masked_fill(causal.view(1, 1, 1, seq_len, seq_len), float("-inf"))
+            attn = attn_scores.softmax(dim=-1)
+            out_g = torch.matmul(attn, Vg)
+            out_heads[idx, :, :seq_len, :] = rearrange(out_g, "b h_kv g l d -> b (h_kv g) l d")[0]
+
+        self.KV_cache.prefill(uuid, tokens, Kh, Vh, mask)
+        out = self.outproj(rearrange(out_heads.to(Qh.dtype), "b h l d -> b l (h d)"))
         return out
 
-    def _generate(self, x:torch.Tensor, uuid):
+    def _generate(self, x:torch.Tensor, tokens, uuid):
         Q = self.q_weights(x)
         K = self.k_weights(x)
         V = self.v_weights(x)
@@ -177,7 +183,7 @@ class MultiQueryAttention:
             Qh = self.rope(Qh, position=q_positions)
             Kh = self.rope(Kh, position=q_positions)
 
-        pages_info = self.KV_cache.append_and_fetch(uuid, Kh, Vh)
+        pages_info = self.KV_cache.append_and_fetch(uuid, Kh, Vh, tokens[:, 0])
         seq_len_per_page = self.KV_cache.block_size
         out = torch.zeros(
                     x.shape[0],
@@ -227,7 +233,7 @@ class MultiQueryAttention:
                 device=Qh.device,
             )
             tokens_seen = 0
-            K_pages,V_pages = self.KV_cache._get_pages(state["indexes"])
+            K_pages,V_pages = self.KV_cache.get_pages(state["indexes"])
             for k_block, v_block in zip(K_pages, V_pages):
                 valid_tokens = min(self.KV_cache.block_size, token_count - tokens_seen)
                 if valid_tokens <= 0:
@@ -252,11 +258,8 @@ class TransformerBlock:
         self.attention = attention
         self.post_norm = post_norm
 
-    def __call__(self, x:torch.Tensor, prefill, mask, uuid):
+    def __call__(self, x:torch.Tensor, tokens, prefill, mask, uuid):
         attn_in = self.pre_norm(x)
-        x = x + self.attention(attn_in, prefill, mask, uuid)
+        x = x + self.attention(attn_in, tokens, prefill, mask, uuid)
         mlp_in = self.post_norm(x)
         return  x + self.mlp(mlp_in)
-
-# todo modify model processor to admit reject new requests based on usage of cache
-# before admiting new req: needed_blocks = ceil((prompt_len + max_new_tokens) / block_size)

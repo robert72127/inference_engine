@@ -40,6 +40,7 @@ class ServerHandle:
         self.input_token: int | None = None
         self.token_q: queue.Queue[int] = queue.Queue()
         self.finished = False
+        self.cancelled = False
 
 @dataclass(frozen=True)
 class RemoteHandle:
@@ -181,6 +182,7 @@ class ModelProcessor:
 
         self.prefill_waiting: list[ServerHandle] = []
         self.generating: list[ServerHandle] = []
+        self.in_flight: set[int] = set()
 
         self.worker = threading.Thread(
             target=self.worker_loop,
@@ -241,11 +243,14 @@ class ModelProcessor:
 
     async def release(self, handle_id: int):
         with self.cv:
-            handle = self.handles.pop(handle_id, None)
+            handle = self.handles.get(handle_id)
             self.prefill_waiting = [h for h in self.prefill_waiting if h.id != handle_id]
             self.generating = [h for h in self.generating if h.id != handle_id]
             if handle is not None:
-                self._release_caches(handle.id)
+                handle.cancelled = True
+                if handle_id not in self.in_flight:
+                    self.handles.pop(handle_id, None)
+                    self._release_caches(handle.id)
             self.cv.notify()
 
     def _make_batch(self, batch: list[ServerHandle], op: OP):
@@ -325,17 +330,19 @@ class ModelProcessor:
                 if not batch:
                     next_op = OP.PREFILL if op == OP.GENERATE else OP.GENERATE
                     continue
+                self.in_flight.update(handle.id for handle in batch)
 
             with torch.inference_mode():
                 handle_ids, input_ids, mask = self._make_batch(batch, op)
                 request_key = tuple(handle_ids)
-                logits = self.model(input_ids, op == OP.PREFILL, mask, request_key)
+                logits = self.model(input_ids, input_ids, op == OP.PREFILL, mask, request_key)
                 results = self._decode_batch(logits, batch)
                 results = results.tolist()
 
             with self.cv:
                 for handle, tok in zip(batch, results):
-                    released = handle.id not in self.handles
+                    self.in_flight.discard(handle.id)
+                    released = handle.cancelled or handle.id not in self.handles
                     if op == OP.GENERATE:
                         handle.cache_len += 1
                         handle.generated_tokens += 1
@@ -376,13 +383,8 @@ class ModelProcessor:
     def _get_max_available_occupancy_left(self):
         if not self.kv_caches:
             return 0
-        occupancy_info = self.kv_caches[0].get_occupancy_info()
         max_blocks_per_request = blocks_for_tokens(self.max_request_len, self.kv_caches[0].block_size)
-        return max(
-            0,
-            (occupancy_info["blocks_cnt"] - max_blocks_per_request * occupancy_info["uuid_cnt"])
-            // max_blocks_per_request,
-        )
+        return max(0, self.kv_caches[0].get_blocks_available() // max_blocks_per_request)
 
     def _get_max_generate_batch_size(self):
         if not self.generating:
