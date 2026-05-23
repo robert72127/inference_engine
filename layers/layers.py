@@ -4,7 +4,7 @@ from torch.nn.utils.rnn import pad_sequence
 import math
 
 from kvcache import RadixKVCache
-from triton_kernels import paged_mqa_decode
+from layers.triton_kernels import paged_mqa_decode
 
 class Embedding:
     def __init__(self, weights:torch.Tensor):
@@ -77,6 +77,7 @@ class MultiQueryAttention:
                  out_proj_weights, out_proj_bias,
                  cache_blocks_cnt,
                  cache_block_size,
+                 max_requests_per_uuid,
                 ):
         q_out_shape, _ = q_weights.shape
         kv_out_shape, _ = k_weights.shape
@@ -90,6 +91,7 @@ class MultiQueryAttention:
             head_cnt=self.num_kv_heads,
             num_blocks = cache_blocks_cnt,
             block_size = cache_block_size,
+            max_requests_per_uuid=max_requests_per_uuid,
             device=q_weights.device,
             dtype=q_weights.dtype,
         )
@@ -103,11 +105,16 @@ class MultiQueryAttention:
         self.v_bias = None if v_bias is None else v_bias
 
     # todo fix this to properly operate on block ie directly writing on them etc
-    def __call__(self, x:torch.Tensor, tokens, prefill, mask, uuid):
-        if prefill: return self._prefill(x, tokens, mask, uuid)
+    def __call__(self, x:torch.Tensor, tokens, prefill, mask, uuid, cached_tokens=None):
+        if prefill: return self._prefill(x, tokens, mask, uuid, cached_tokens)
         else: return self._generate(x, tokens, uuid)
 
-    def _prefill(self, x:torch.Tensor, tokens, mask, uuid):
+    def _prefill(self, x:torch.Tensor, tokens, mask, uuid, cached_tokens):
+        if cached_tokens is None:
+            cached_tokens = torch.zeros(x.size(0), device=x.device, dtype=torch.long)
+        else:
+            cached_tokens = cached_tokens.to(device=x.device, dtype=torch.long)
+
         Q = self.q_weights(x)
         K = self.k_weights(x)
         V = self.v_weights(x)
@@ -120,45 +127,62 @@ class MultiQueryAttention:
         Vh = rearrange(V, "b l (h d) -> b h l d", h=self.num_kv_heads)
 
         if self.rope is not None:
-            positions = torch.arange(Qh.size(2), device=Qh.device).unsqueeze(0).expand(Qh.size(0), -1)
+            positions = cached_tokens[:, None] + torch.arange(Qh.size(2), device=Qh.device).unsqueeze(0)
             Qh = self.rope(Qh, position=positions)
             Kh = self.rope(Kh, position=positions)
 
-        # prefills cache from given K,V
-        self.KV_cache.prefill(uuid, tokens, Kh, Vh, mask)
-        
         B, H_q, L, D = Qh.shape
         _, H_kv, _, _ = Kh.shape
+        full_len = tokens.size(1)
+        if mask is None:
+            prompt_lens = torch.full((B,), full_len, device=tokens.device, dtype=torch.long)
+        else:
+            prompt_lens = mask.to(device=tokens.device, dtype=torch.bool).sum(dim=1)
+
+        K_full = torch.zeros(
+            (B, H_kv, full_len, D),
+            device=Kh.device,
+            dtype=Kh.dtype,
+        )
+        V_full = torch.zeros_like(K_full)
 
         group = H_q // H_kv   # number of query heads per kv head
-
-        Qg = Qh.view(B, H_kv, group, L, D)
-        Kg = Kh.unsqueeze(2)
-        Vg = Vh.unsqueeze(2)
-
-        attn_scores = torch.matmul(Qg, Kg.transpose(-1, -2)) / math.sqrt(D)
-        
-        B, H_kv, G, L, _ = attn_scores.shape
-
-        # [L, L] upper-triangular mask where j > i (future positions)
-        causal = torch.triu(
-            torch.ones(L, L, device=attn_scores.device, dtype=torch.bool),
-            diagonal=1,
+        out_heads = torch.zeros(
+            (B, H_q, L, D),
+            device=Qh.device,
+            dtype=torch.float32,
         )
-        
-        attn_scores = attn_scores.masked_fill(causal, float("-inf"))
-        if mask is not None:
-            mask = mask.to(device=attn_scores.device, dtype=torch.bool)
-            key_padding = ~mask[:, None, None, None, :]
-            attn_scores = attn_scores.masked_fill(key_padding, float("-inf"))
-        attn = attn_scores.softmax(dim=-1)
 
-        out_g = torch.matmul(attn, Vg)
+        for idx in range(B):
+            prefix_len = int(cached_tokens[idx].item())
+            seq_len = int(prompt_lens[idx].item())
+            suffix_len = seq_len - prefix_len
+            if suffix_len <= 0:
+                continue
 
-        out_heads = rearrange(out_g, "b h_kv g l d -> b l (h_kv g d)")
-        out = self.outproj(out_heads)
-        if mask is not None:
-            out = out * mask[..., None].to(out.dtype)
+            if prefix_len > 0:
+                self.KV_cache.uuids[uuid[idx]].fill(
+                    K_full[idx, :, :prefix_len, :],
+                    V_full[idx, :, :prefix_len, :],
+                )
+            K_full[idx, :, prefix_len:seq_len, :] = Kh[idx, :, :suffix_len, :]
+            V_full[idx, :, prefix_len:seq_len, :] = Vh[idx, :, :suffix_len, :]
+
+            Qg = Qh[idx : idx + 1, :, :suffix_len, :].view(1, H_kv, group, suffix_len, D)
+            Kg = K_full[idx : idx + 1, :, :seq_len, :].unsqueeze(2)
+            Vg = V_full[idx : idx + 1, :, :seq_len, :].unsqueeze(2)
+            attn_scores = torch.matmul(Qg, Kg.transpose(-1, -2)) / math.sqrt(D)
+            causal = torch.triu(
+                torch.ones(suffix_len, seq_len, device=attn_scores.device, dtype=torch.bool),
+                diagonal=prefix_len + 1,
+            )
+            attn_scores = attn_scores.masked_fill(causal.view(1, 1, 1, suffix_len, seq_len), float("-inf"))
+            attn = attn_scores.softmax(dim=-1)
+            out_g = torch.matmul(attn, Vg)
+            out_heads[idx, :, :suffix_len, :] = rearrange(out_g, "b h_kv g l d -> b (h_kv g) l d")[0]
+
+        self.KV_cache.prefill(uuid, tokens, K_full, V_full, mask)
+        out = self.outproj(rearrange(out_heads.to(Qh.dtype), "b h l d -> b l (h d)"))
         return out
 
     def _generate(self, x:torch.Tensor, tokens, uuid):
@@ -252,12 +276,11 @@ class TransformerBlock:
         self.attention = attention
         self.post_norm = post_norm
 
-    def __call__(self, x:torch.Tensor, tokens, prefill, mask, uuid):
+    def __call__(self, x:torch.Tensor, tokens, prefill, mask, uuid, cached_tokens=None):
         attn_in = self.pre_norm(x)
-        x = x + self.attention(attn_in, tokens, prefill, mask, uuid)
+        x = x + self.attention(attn_in, tokens, prefill, mask, uuid, cached_tokens=cached_tokens)
         mlp_in = self.post_norm(x)
         return  x + self.mlp(mlp_in)
 
 # todo modify model processor to admit reject new requests based on usage of cache
 # before admiting new req: needed_blocks = ceil((prompt_len + max_new_tokens) / block_size)
-

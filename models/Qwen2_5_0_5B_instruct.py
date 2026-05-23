@@ -86,6 +86,7 @@ def parse_attn(
     rope,
     cache_blocks_cnt,
     cache_block_size,
+    max_requests_per_uuid,
 ):
     k_proj_bias = k_proj_weight = None
     v_proj_bias = v_proj_weight = None
@@ -124,6 +125,7 @@ def parse_attn(
         out_proj_weights=o_proj_weight, out_proj_bias=o_proj_bias,
         cache_blocks_cnt=cache_blocks_cnt,
         cache_block_size=cache_block_size,
+        max_requests_per_uuid=max_requests_per_uuid,
     )
 
 def cache_blocks_cnt_from_budget(
@@ -156,6 +158,7 @@ def parse_model(
     memory_available: int,
 ):
     cache_block_size = CACHE_BLOCK_SIZE
+    max_requests_per_uuid = blocks_for_tokens(cache_max_seq_len, cache_block_size)
     tensors = load_file(model_dir, device=str(device))
     cache_blocks_cnt = cache_blocks_cnt_from_budget(
         cfg,
@@ -223,6 +226,7 @@ def parse_model(
                         rope,
                         cache_blocks_cnt,
                         cache_block_size,
+                        max_requests_per_uuid,
                     )
                     kv_caches.append(self_attn.KV_cache)
                 case _: raise Exception("Unknown layer, aborting")
@@ -258,14 +262,54 @@ class Qwen2_5_0_5B_Instruct(Model):
             memory_available=memory_available,
         )
   
+    def _prepare_prefill(self, tokens: torch.Tensor, mask: torch.Tensor | None, uuid):
+        prompt_lens = (
+            torch.full((tokens.size(0),), tokens.size(1), device=tokens.device, dtype=torch.long)
+            if mask is None
+            else mask.to(device=tokens.device, dtype=torch.bool).sum(dim=1)
+        )
+        prompt_tokens = [tokens[i, : prompt_lens[i]] for i in range(tokens.size(0))]
+        layer_hits = [cache.init(uuid, prompt_tokens) for cache in self.kv_caches]
+        shared_blocks = []
+        for batch_idx in range(tokens.size(0)):
+            hit_blocks = min(layer_hit[batch_idx][1] for layer_hit in layer_hits)
+            max_reuse_blocks = int((int(prompt_lens[batch_idx].item()) - 1) // self.kv_caches[0].block_size)
+            shared_blocks.append(min(hit_blocks, max_reuse_blocks))
+        for cache in self.kv_caches:
+            cache.clamp_init_blocks(uuid, shared_blocks)
+
+        cached_tokens = torch.tensor(
+            [blocks * self.kv_caches[0].block_size for blocks in shared_blocks],
+            device=tokens.device,
+            dtype=torch.long,
+        )
+        suffix_tokens = [
+            tokens[i, cached_tokens[i] : prompt_lens[i]]
+            for i in range(tokens.size(0))
+        ]
+        suffix_input = torch.nn.utils.rnn.pad_sequence(
+            suffix_tokens,
+            batch_first=True,
+            padding_value=0,
+        )
+        return suffix_input, cached_tokens
+
     @torch.inference_mode()
     def __call__(self, input, tokens, prefill, mask, uuid):
-        out = input.to(self.device)
         tokens = tokens.to(self.device)
         mask = None if mask is None else mask.to(self.device)
+        cached_tokens = None
+        if prefill:
+            out, cached_tokens = self._prepare_prefill(tokens, mask, uuid)
+        else:
+            out = input.to(self.device)
         for layer in self.layers: 
             layer, is_transformer = layer
-            out = layer(out, tokens=tokens, prefill=prefill, mask=mask, uuid=uuid) if is_transformer else layer(out)
+            out = (
+                layer(out, tokens=tokens, prefill=prefill, mask=mask, uuid=uuid, cached_tokens=cached_tokens)
+                if is_transformer
+                else layer(out)
+            )
         return out
 
 if __name__ == '__main__':

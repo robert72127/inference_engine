@@ -124,13 +124,13 @@ class RadixKVCache:
         def search(self, toks):
             return self.root.search(toks, [])
         
-    def __init__(self, d_head, head_cnt, num_blocks, block_size, max_requests_per_uuid, device, dtype):
+    def __init__(self, d_head, head_cnt, num_blocks, block_size, max_requests_per_uuid=None, device=None, dtype=None):
         self.d_head = d_head
         self.head_cnt = head_cnt
         self.blocks_cnt = num_blocks
         self.block_size = block_size
 
-        self.max_requests_per_uuid = max_requests_per_uuid
+        self.max_requests_per_uuid = num_blocks if max_requests_per_uuid is None else max_requests_per_uuid
         self.uuids = {}
         
         # blocks are put there when they are used by at least one active uuid
@@ -252,6 +252,26 @@ class RadixKVCache:
             out.append((blocks, blocks_cnt))
         return out
 
+    def clamp_init_blocks(self, uuids, block_counts):
+        for uuid, keep_blocks in zip(uuids, block_counts):
+            uuid_state = self.uuids[uuid]
+            keep_blocks = int(keep_blocks)
+            if keep_blocks >= len(uuid_state.commited_blocks):
+                continue
+
+            for block in uuid_state.commited_blocks[keep_blocks:]:
+                self.locked_slots[block] -= 1
+                if self.locked_slots[block] == 0:
+                    del self.locked_slots[block]
+                    self._touch_resident_block(block)
+
+            uuid_state.commited_blocks = uuid_state.commited_blocks[:keep_blocks]
+            uuid_state.blocks_count = keep_blocks
+            last_node = self.radix_tree.root
+            if keep_blocks > 0:
+                last_node = self.block_to_node[uuid_state.commited_blocks[-1]]
+            self.radix_tree.add_node(uuid, last_node)
+
     def prefill(self, uuids, toks, K, V, mask):
         for i, uuid in enumerate(uuids):
             uuid_state = self.uuids[uuid]
@@ -316,3 +336,5 @@ class RadixKVCache:
         for uuid in uuids:
             self._free_blocks(uuid)
 
+
+PagedKVCache = RadixKVCache
