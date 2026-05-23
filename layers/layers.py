@@ -217,13 +217,13 @@ class MultiQueryAttention:
     def _paged_mqa_cpu(self, pages_info, Qh, out):
         group_size = self.num_attn_heads // self.num_kv_heads
         scale = 1 / math.sqrt(self.head_dim)
-        kv_head_idx = torch.arange(self.num_attn_heads, device=Q.device) // group_size
+        kv_head_idx = torch.arange(self.num_attn_heads, device=Qh.device) // group_size
 
         for idx, state in enumerate(pages_info):
             q = Qh[idx].squeeze(dim=1).to(torch.float32)
             token_count = state["token_count"]
-            m_max = torch.full((self.num_attn_heads,), float("-inf"), device=Q.device)
-            l = torch.zeros((self.num_attn_heads,), device=Q.device)
+            m_max = torch.full((self.num_attn_heads,), float("-inf"), device=Qh.device)
+            l = torch.zeros((self.num_attn_heads,), device=Qh.device)
             acc = torch.zeros(
                 self.num_attn_heads,
                 self.head_dim,
