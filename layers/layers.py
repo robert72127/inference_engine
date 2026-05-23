@@ -4,7 +4,7 @@ from torch.nn.utils.rnn import pad_sequence
 import math
 
 from kvcache import PagedKVCache
-from triton_kernels import paged_mqa_decode
+from layers.triton_kernels import paged_mqa_decode
 
 class Embedding:
     def __init__(self, weights:torch.Tensor):

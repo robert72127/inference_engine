@@ -40,6 +40,7 @@ class ServerHandle:
         self.input_token: int | None = None
         self.token_q: queue.Queue[int] = queue.Queue()
         self.finished = False
+        self.cancelled = False
 
 @dataclass(frozen=True)
 class RemoteHandle:
@@ -181,6 +182,7 @@ class ModelProcessor:
 
         self.prefill_waiting: list[ServerHandle] = []
         self.generating: list[ServerHandle] = []
+        self.in_flight: set[int] = set()
 
         self.worker = threading.Thread(
             target=self.worker_loop,
@@ -241,11 +243,14 @@ class ModelProcessor:
 
     async def release(self, handle_id: int):
         with self.cv:
-            handle = self.handles.pop(handle_id, None)
+            handle = self.handles.get(handle_id)
             self.prefill_waiting = [h for h in self.prefill_waiting if h.id != handle_id]
             self.generating = [h for h in self.generating if h.id != handle_id]
             if handle is not None:
-                self._release_caches(handle.id)
+                handle.cancelled = True
+                if handle_id not in self.in_flight:
+                    self.handles.pop(handle_id, None)
+                    self._release_caches(handle.id)
             self.cv.notify()
 
     def _make_batch(self, batch: list[ServerHandle], op: OP):
@@ -325,6 +330,7 @@ class ModelProcessor:
                 if not batch:
                     next_op = OP.PREFILL if op == OP.GENERATE else OP.GENERATE
                     continue
+                self.in_flight.update(handle.id for handle in batch)
 
             with torch.inference_mode():
                 handle_ids, input_ids, mask = self._make_batch(batch, op)
@@ -335,7 +341,8 @@ class ModelProcessor:
 
             with self.cv:
                 for handle, tok in zip(batch, results):
-                    released = handle.id not in self.handles
+                    self.in_flight.discard(handle.id)
+                    released = handle.cancelled or handle.id not in self.handles
                     if op == OP.GENERATE:
                         handle.cache_len += 1
                         handle.generated_tokens += 1
