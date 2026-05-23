@@ -262,51 +262,15 @@ class Qwen2_5_0_5B_Instruct(Model):
             memory_available=memory_available,
         )
   
-    def _prepare_prefill(self, tokens: torch.Tensor, mask: torch.Tensor | None, uuid):
-        prompt_lens = (
-            torch.full((tokens.size(0),), tokens.size(1), device=tokens.device, dtype=torch.long)
-            if mask is None
-            else mask.to(device=tokens.device, dtype=torch.bool).sum(dim=1)
-        )
-        prompt_tokens = [tokens[i, : prompt_lens[i]] for i in range(tokens.size(0))]
-        layer_hits = [cache.init(uuid, prompt_tokens) for cache in self.kv_caches]
-        shared_blocks = []
-        for batch_idx in range(tokens.size(0)):
-            hit_blocks = min(layer_hit[batch_idx][1] for layer_hit in layer_hits)
-            max_reuse_blocks = int((int(prompt_lens[batch_idx].item()) - 1) // self.kv_caches[0].block_size)
-            shared_blocks.append(min(hit_blocks, max_reuse_blocks))
-        for cache in self.kv_caches:
-            cache.clamp_init_blocks(uuid, shared_blocks)
-
-        cached_tokens = torch.tensor(
-            [blocks * self.kv_caches[0].block_size for blocks in shared_blocks],
-            device=tokens.device,
-            dtype=torch.long,
-        )
-        suffix_tokens = [
-            tokens[i, cached_tokens[i] : prompt_lens[i]]
-            for i in range(tokens.size(0))
-        ]
-        suffix_input = torch.nn.utils.rnn.pad_sequence(
-            suffix_tokens,
-            batch_first=True,
-            padding_value=0,
-        )
-        return suffix_input, cached_tokens
-
     @torch.inference_mode()
     def __call__(self, input, tokens, prefill, mask, uuid):
         tokens = tokens.to(self.device)
         mask = None if mask is None else mask.to(self.device)
-        cached_tokens = None
-        if prefill:
-            out, cached_tokens = self._prepare_prefill(tokens, mask, uuid)
-        else:
-            out = input.to(self.device)
+        out = input.to(self.device)
         for layer in self.layers: 
             layer, is_transformer = layer
             out = (
-                layer(out, tokens=tokens, prefill=prefill, mask=mask, uuid=uuid, cached_tokens=cached_tokens)
+                layer(out, tokens=tokens, prefill=prefill, mask=mask, uuid=uuid)
                 if is_transformer
                 else layer(out)
             )

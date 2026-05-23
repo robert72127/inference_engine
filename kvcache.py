@@ -334,5 +334,3 @@ class RadixKVCache:
         for uuid in uuids:
             self._free_blocks(uuid)
 
-
-PagedKVCache = RadixKVCache

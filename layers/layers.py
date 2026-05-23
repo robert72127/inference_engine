@@ -104,16 +104,11 @@ class MultiQueryAttention:
         self.k_bias = None if k_bias is None else k_bias
         self.v_bias = None if v_bias is None else v_bias
 
-    def __call__(self, x:torch.Tensor, tokens, prefill, mask, uuid, cached_tokens=None):
-        if prefill: return self._prefill(x, tokens, mask, uuid, cached_tokens)
+    def __call__(self, x:torch.Tensor, tokens, prefill, mask, uuid):
+        if prefill: return self._prefill(x, tokens, mask, uuid)
         else: return self._generate(x, tokens, uuid)
 
-    def _prefill(self, x:torch.Tensor, tokens, mask, uuid, cached_tokens):
-        if cached_tokens is None:
-            cached_tokens = torch.zeros(x.size(0), device=x.device, dtype=torch.long)
-        else:
-            cached_tokens = cached_tokens.to(device=x.device, dtype=torch.long)
-
+    def _prefill(self, x:torch.Tensor, tokens, mask, uuid):
         Q = self.q_weights(x)
         K = self.k_weights(x)
         V = self.v_weights(x)
@@ -126,9 +121,8 @@ class MultiQueryAttention:
         Vh = rearrange(V, "b l (h d) -> b h l d", h=self.num_kv_heads)
 
         if self.rope is not None:
-            positions = cached_tokens[:, None] + torch.arange(Qh.size(2), device=Qh.device).unsqueeze(0)
-            Qh = self.rope(Qh, position=positions)
-            Kh = self.rope(Kh, position=positions)
+            Qh = self.rope(Qh)
+            Kh = self.rope(Kh)
 
         B, H_q, L, D = Qh.shape
         _, H_kv, _, _ = Kh.shape
@@ -138,12 +132,11 @@ class MultiQueryAttention:
         else:
             prompt_lens = mask.to(device=tokens.device, dtype=torch.bool).sum(dim=1)
 
-        K_full = torch.zeros(
-            (B, H_kv, full_len, D),
-            device=Kh.device,
-            dtype=Kh.dtype,
-        )
-        V_full = torch.zeros_like(K_full)
+        prompt_tokens = [
+            tokens[idx, : int(prompt_lens[idx].item())]
+            for idx in range(B)
+        ]
+        self.KV_cache.init(uuid, prompt_tokens)
 
         group = H_q // H_kv   # number of query heads per kv head
         out_heads = torch.zeros(
@@ -153,34 +146,24 @@ class MultiQueryAttention:
         )
 
         for idx in range(B):
-            prefix_len = int(cached_tokens[idx].item())
             seq_len = int(prompt_lens[idx].item())
-            suffix_len = seq_len - prefix_len
-            if suffix_len <= 0:
+            if seq_len <= 0:
                 continue
 
-            if prefix_len > 0:
-                self.KV_cache.uuids[uuid[idx]].fill(
-                    K_full[idx, :, :prefix_len, :],
-                    V_full[idx, :, :prefix_len, :],
-                )
-            K_full[idx, :, prefix_len:seq_len, :] = Kh[idx, :, :suffix_len, :]
-            V_full[idx, :, prefix_len:seq_len, :] = Vh[idx, :, :suffix_len, :]
-
-            Qg = Qh[idx : idx + 1, :, :suffix_len, :].view(1, H_kv, group, suffix_len, D)
-            Kg = K_full[idx : idx + 1, :, :seq_len, :].unsqueeze(2)
-            Vg = V_full[idx : idx + 1, :, :seq_len, :].unsqueeze(2)
+            Qg = Qh[idx : idx + 1, :, :seq_len, :].view(1, H_kv, group, seq_len, D)
+            Kg = Kh[idx : idx + 1, :, :seq_len, :].unsqueeze(2)
+            Vg = Vh[idx : idx + 1, :, :seq_len, :].unsqueeze(2)
             attn_scores = torch.matmul(Qg, Kg.transpose(-1, -2)) / math.sqrt(D)
             causal = torch.triu(
-                torch.ones(suffix_len, seq_len, device=attn_scores.device, dtype=torch.bool),
-                diagonal=prefix_len + 1,
+                torch.ones(seq_len, seq_len, device=attn_scores.device, dtype=torch.bool),
+                diagonal=1,
             )
-            attn_scores = attn_scores.masked_fill(causal.view(1, 1, 1, suffix_len, seq_len), float("-inf"))
+            attn_scores = attn_scores.masked_fill(causal.view(1, 1, 1, seq_len, seq_len), float("-inf"))
             attn = attn_scores.softmax(dim=-1)
             out_g = torch.matmul(attn, Vg)
-            out_heads[idx, :, :suffix_len, :] = rearrange(out_g, "b h_kv g l d -> b (h_kv g) l d")[0]
+            out_heads[idx, :, :seq_len, :] = rearrange(out_g, "b h_kv g l d -> b (h_kv g) l d")[0]
 
-        self.KV_cache.prefill(uuid, tokens, K_full, V_full, mask)
+        self.KV_cache.prefill(uuid, tokens, Kh, Vh, mask)
         out = self.outproj(rearrange(out_heads.to(Qh.dtype), "b h l d -> b l (h d)"))
         return out
 
@@ -275,9 +258,8 @@ class TransformerBlock:
         self.attention = attention
         self.post_norm = post_norm
 
-    def __call__(self, x:torch.Tensor, tokens, prefill, mask, uuid, cached_tokens=None):
+    def __call__(self, x:torch.Tensor, tokens, prefill, mask, uuid):
         attn_in = self.pre_norm(x)
-        x = x + self.attention(attn_in, tokens, prefill, mask, uuid, cached_tokens=cached_tokens)
+        x = x + self.attention(attn_in, tokens, prefill, mask, uuid)
         mlp_in = self.post_norm(x)
         return  x + self.mlp(mlp_in)
-
