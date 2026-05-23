@@ -2,12 +2,12 @@ import unittest
 
 import torch
 
-from kvcache import PagedKVCache
+from kvcache import RadixKVCache
 
 
 class KVCacheTests(unittest.TestCase):
     def make_cache(self, *, d_head=4, head_cnt=1, num_blocks=4, block_size=2):
-        return PagedKVCache(
+        return RadixKVCache(
             d_head=d_head,
             head_cnt=head_cnt,
             num_blocks=num_blocks,
