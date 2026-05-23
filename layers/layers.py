@@ -3,6 +3,7 @@ import torch
 import math
 
 from kvcache import PagedKVCache
+from triton_kernels import paged_mqa_decode
 
 class Embedding:
     def __init__(self, weights:torch.Tensor):
@@ -175,54 +176,90 @@ class MultiQueryAttention:
             Qh = self.rope(Qh, position=q_positions)
             Kh = self.rope(Kh, position=q_positions)
 
-        pages_and_meta = self.KV_cache.append_and_fetch(uuid, Kh, Vh)
-
+        pages_info = self.KV_cache.append_and_fetch(uuid, Kh, Vh)
+        seq_len_per_page = self.KV_cache.block_size
         out = torch.zeros(
-            x.shape[0],
-            self.num_attn_heads,
-            self.head_dim,
-            dtype=Q.dtype,
-            device=Q.device,
-        )
-        group_size = self.num_attn_heads // self.num_kv_heads
-        scale = 1 / math.sqrt(self.head_dim)
-        kv_head_idx = torch.arange(self.num_attn_heads, device=Q.device) // group_size
+                    x.shape[0],
+                    self.num_attn_heads,
+                    self.head_dim,
+                    dtype=Q.dtype,
+                    device=Q.device,
+                )
+        page_indexes = [pm["indexes"] for pm in pages_info]
 
-        for idx, state in enumerate(pages_and_meta):
-            q = Qh[idx].squeeze(dim=1).to(torch.float32)
-            token_count = state["token_count"]
-            m_max = torch.full((self.num_attn_heads,), float("-inf"), device=Q.device)
-            l = torch.zeros((self.num_attn_heads,), device=Q.device)
-            acc = torch.zeros(
-                self.num_attn_heads,
-                self.head_dim,
-                dtype=torch.float32,
-                device=Qh.device,
+        if x.device == torch.device("cuda"):
+            max_len = max(len(x) for x in page_indexes)
+            padded_indexes = torch.full(
+                (len(page_indexes), max_len),
+                fill_value=-1,   # padding value
+                dtype=torch.long,
+                device=x.device,
             )
 
-            tokens_seen = 0
-            for k_block, v_block in zip(state["K"], state["V"]):
-                valid_tokens = min(self.KV_cache.block_size, token_count - tokens_seen)
-                if valid_tokens <= 0:
-                    break
+            attn_out = paged_mqa_decode(
+                q=Qh, K_cache=self.KV_cache.K, V_cache=self.KV_cache.V, out=out,
+                page_indexes = page_indexes,
+                KV_cache_block_cnt=self.KV_cache.blocks_cnt,
+                batch_size = len(uuid),
+                tok_cnt= torch.tensor([page["token_count"] for page in pages_info], device=Q.device),
+                seq_len_per_page=seq_len_per_page,
+                d_head=self.head_dim,
+                num_attn_heads=self.num_attn_heads,
+                num_kv_heads=self.num_kv_heads,
+            )
 
-                k_block = k_block[:, :valid_tokens, :][kv_head_idx].to(torch.float32)
-                v_block = v_block[:, :valid_tokens, :][kv_head_idx].to(torch.float32)
-                s = torch.einsum("h d, h s d -> h s", q, k_block) * scale
+            out = rearrange(out, "b h d -> b 1 (h d)")
+            return self.outproj(out)
 
-                m_block = s.max(dim=-1).values
-                m_new = torch.maximum(m_max, m_block)
-                old_rescale = torch.exp(m_max - m_new)
-                m_max = m_new
-                weight = torch.exp(s - m_max[:, None])
-                l = l * old_rescale + torch.sum(weight, dim=-1)
-                acc = acc * old_rescale[:, None] + torch.einsum("h s, h s d -> h d", weight, v_block)
-                tokens_seen += valid_tokens
+        else:
+            out = torch.zeros(
+                x.shape[0],
+                self.num_attn_heads,
+                self.head_dim,
+                dtype=Q.dtype,
+                device=Q.device,
+            )
+            group_size = self.num_attn_heads // self.num_kv_heads
+            scale = 1 / math.sqrt(self.head_dim)
+            kv_head_idx = torch.arange(self.num_attn_heads, device=Q.device) // group_size
 
-            out[idx] = (acc / l[:, None]).to(out.dtype)
+            for idx, state in enumerate(pages_info):
+                q = Qh[idx].squeeze(dim=1).to(torch.float32)
+                token_count = state["token_count"]
+                m_max = torch.full((self.num_attn_heads,), float("-inf"), device=Q.device)
+                l = torch.zeros((self.num_attn_heads,), device=Q.device)
+                acc = torch.zeros(
+                    self.num_attn_heads,
+                    self.head_dim,
+                    dtype=torch.float32,
+                    device=Qh.device,
+                )
 
-        out = rearrange(out, "b h d -> b 1 (h d)")
-        return self.outproj(out)
+                tokens_seen = 0
+                K_pages,V_pages = self.KV_cache._get_pages(state["indexes"])
+                for k_block, v_block in zip(K_pages, V_pages):
+                    valid_tokens = min(self.KV_cache.block_size, token_count - tokens_seen)
+                    if valid_tokens <= 0:
+                        break
+
+                    k_block = k_block[:, :valid_tokens, :][kv_head_idx].to(torch.float32)
+                    v_block = v_block[:, :valid_tokens, :][kv_head_idx].to(torch.float32)
+                    s = torch.einsum("h d, h s d -> h s", q, k_block) * scale
+
+                    m_block = s.max(dim=-1).values
+                    m_new = torch.maximum(m_max, m_block)
+                    old_rescale = torch.exp(m_max - m_new)
+                    m_max = m_new
+                    weight = torch.exp(s - m_max[:, None])
+                    l = l * old_rescale + torch.sum(weight, dim=-1)
+                    acc = acc * old_rescale[:, None] + torch.einsum("h s, h s d -> h d", weight, v_block)
+                    tokens_seen += valid_tokens
+
+                out[idx] = (acc / l[:, None]).to(out.dtype)
+
+            out = rearrange(out, "b h d -> b 1 (h d)")
+            return self.outproj(out)
+
 
 class TransformerBlock:
     def __init__(self, mlp, pre_norm, attention, post_norm):

@@ -25,13 +25,12 @@ class PagedKVCache:
             self.blocks_count = blocks_count
             self.write_block_occupancy = write_block_occupancy
 
-        def get_pages_and_meta(self):
+        def get_pages_info(self):
             K = [self.kv_cache.K[idx] for idx in self.commited_blocks] + [self.kv_cache.K[self.write_block]]
             V = [self.kv_cache.V[idx] for idx in self.commited_blocks] + [self.kv_cache.V[self.write_block]]
             seq_len = self.block_size * len(self.commited_blocks) + self.write_block_occupancy
             return {
-                "K":K,
-                "V":V,
+                "indexes": self.commited_blocks + [self.write_block],
                 "token_count":seq_len
             }
 
@@ -127,7 +126,7 @@ class PagedKVCache:
         max_len = 0
         batch_size = 0
         lengths = []
-        pages_and_meta = []
+        pages_info = []
         for i, uuid in enumerate(uuids):
             uuid_state = self.uuids[uuid]
             uuid_state.insert_single(K[i, :, 0, :], V[i, :, 0, :])
@@ -135,8 +134,8 @@ class PagedKVCache:
             max_len = max(max_len, length)
             lengths.append(length)
             batch_size += 1
-            pages_and_meta += [uuid_state.get_pages_and_meta()]
-        return pages_and_meta
+            pages_info += [uuid_state.get_pages_info()]
+        return pages_info
 
     def release(self, uuids):
         for uuid in uuids:
