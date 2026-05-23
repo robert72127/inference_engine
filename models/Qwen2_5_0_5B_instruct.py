@@ -259,12 +259,13 @@ class Qwen2_5_0_5B_Instruct(Model):
         )
   
     @torch.inference_mode()
-    def __call__(self, input, prefill, mask, uuid):
+    def __call__(self, input, tokens, prefill, mask, uuid):
         out = input.to(self.device)
+        tokens = tokens.to(self.device)
         mask = None if mask is None else mask.to(self.device)
         for layer in self.layers: 
             layer, is_transformer = layer
-            out = layer(out, prefill=prefill, mask=mask, uuid=uuid) if is_transformer else layer(out)
+            out = layer(out, tokens=tokens, prefill=prefill, mask=mask, uuid=uuid) if is_transformer else layer(out)
         return out
 
 if __name__ == '__main__':

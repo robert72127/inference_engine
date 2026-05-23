@@ -315,3 +315,4 @@ class RadixKVCache:
     def release(self, uuids):
         for uuid in uuids:
             self._free_blocks(uuid)
+

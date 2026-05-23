@@ -3,7 +3,7 @@ import torch
 from torch.nn.utils.rnn import pad_sequence
 import math
 
-from kvcache import PagedKVCache
+from kvcache import RadixKVCache
 from triton_kernels import paged_mqa_decode
 
 class Embedding:
@@ -85,7 +85,7 @@ class MultiQueryAttention:
         self.rope = rope
         self.head_dim = q_out_shape // self.num_attn_heads
         self.max_seq_len = max_seq_len
-        self.KV_cache = PagedKVCache(
+        self.KV_cache = RadixKVCache(
             d_head=self.head_dim, 
             head_cnt=self.num_kv_heads,
             num_blocks = cache_blocks_cnt,
@@ -103,11 +103,11 @@ class MultiQueryAttention:
         self.v_bias = None if v_bias is None else v_bias
 
     # todo fix this to properly operate on block ie directly writing on them etc
-    def __call__(self, x:torch.Tensor, prefill, mask, uuid):
-        if prefill: return self._prefill(x, mask, uuid)
-        else: return self._generate(x, uuid)
+    def __call__(self, x:torch.Tensor, tokens, prefill, mask, uuid):
+        if prefill: return self._prefill(x, tokens, mask, uuid)
+        else: return self._generate(x, tokens, uuid)
 
-    def _prefill(self, x:torch.Tensor, mask, uuid):
+    def _prefill(self, x:torch.Tensor, tokens, mask, uuid):
         Q = self.q_weights(x)
         K = self.k_weights(x)
         V = self.v_weights(x)
@@ -125,7 +125,7 @@ class MultiQueryAttention:
             Kh = self.rope(Kh, position=positions)
 
         # prefills cache from given K,V
-        self.KV_cache.prefill(uuid, Kh, Vh, mask)
+        self.KV_cache.prefill(uuid, tokens, Kh, Vh, mask)
         
         B, H_q, L, D = Qh.shape
         _, H_kv, _, _ = Kh.shape
@@ -161,7 +161,7 @@ class MultiQueryAttention:
             out = out * mask[..., None].to(out.dtype)
         return out
 
-    def _generate(self, x:torch.Tensor, uuid):
+    def _generate(self, x:torch.Tensor, tokens, uuid):
         Q = self.q_weights(x)
         K = self.k_weights(x)
         V = self.v_weights(x)
@@ -177,7 +177,7 @@ class MultiQueryAttention:
             Qh = self.rope(Qh, position=q_positions)
             Kh = self.rope(Kh, position=q_positions)
 
-        pages_info = self.KV_cache.append_and_fetch(uuid, Kh, Vh)
+        pages_info = self.KV_cache.append_and_fetch(uuid, Kh, Vh, tokens[:, 0])
         seq_len_per_page = self.KV_cache.block_size
         out = torch.zeros(
                     x.shape[0],
@@ -252,11 +252,12 @@ class TransformerBlock:
         self.attention = attention
         self.post_norm = post_norm
 
-    def __call__(self, x:torch.Tensor, prefill, mask, uuid):
+    def __call__(self, x:torch.Tensor, tokens, prefill, mask, uuid):
         attn_in = self.pre_norm(x)
-        x = x + self.attention(attn_in, prefill, mask, uuid)
+        x = x + self.attention(attn_in, tokens, prefill, mask, uuid)
         mlp_in = self.post_norm(x)
         return  x + self.mlp(mlp_in)
 
 # todo modify model processor to admit reject new requests based on usage of cache
 # before admiting new req: needed_blocks = ceil((prompt_len + max_new_tokens) / block_size)
+
