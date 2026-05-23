@@ -376,13 +376,8 @@ class ModelProcessor:
     def _get_max_available_occupancy_left(self):
         if not self.kv_caches:
             return 0
-        occupancy_info = self.kv_caches[0].get_occupancy_info()
         max_blocks_per_request = blocks_for_tokens(self.max_request_len, self.kv_caches[0].block_size)
-        return max(
-            0,
-            (occupancy_info["blocks_cnt"] - max_blocks_per_request * occupancy_info["uuid_cnt"])
-            // max_blocks_per_request,
-        )
+        return max(0,  self.kv_caches[0].get_blocks_available() / max_blocks_per_request)
 
     def _get_max_generate_batch_size(self):
         if not self.generating:
