@@ -104,7 +104,6 @@ class MultiQueryAttention:
         self.k_bias = None if k_bias is None else k_bias
         self.v_bias = None if v_bias is None else v_bias
 
-    # todo fix this to properly operate on block ie directly writing on them etc
     def __call__(self, x:torch.Tensor, tokens, prefill, mask, uuid, cached_tokens=None):
         if prefill: return self._prefill(x, tokens, mask, uuid, cached_tokens)
         else: return self._generate(x, tokens, uuid)
@@ -282,5 +281,3 @@ class TransformerBlock:
         mlp_in = self.post_norm(x)
         return  x + self.mlp(mlp_in)
 
-# todo modify model processor to admit reject new requests based on usage of cache
-# before admiting new req: needed_blocks = ceil((prompt_len + max_new_tokens) / block_size)

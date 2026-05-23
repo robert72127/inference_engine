@@ -159,7 +159,6 @@ class RadixKVCache:
         self.radix_tree.add_node(uuid, nodes[-1] if nodes else self.radix_tree.root)
         return [node.page_id for node in nodes], len(nodes)
 
-    # todo return amount of non locked pages - amount current uuids could still consume
     def get_blocks_available(self):
         reserved=0
         for uuid in self.uuids:
@@ -168,7 +167,6 @@ class RadixKVCache:
         
         return self.free_slots_cnt + len(self.resident_lru) - reserved
 
-    # todo needs to be updated, ie decide on eviction policy
     def get_free_blocks(self, block_cnt=1):
         blocks = []
         for _ in range(block_cnt):
