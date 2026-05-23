@@ -1,5 +1,6 @@
 from einops import rearrange
 import torch
+from torch.nn.utils.rnn import pad_sequence
 import math
 
 from kvcache import PagedKVCache
@@ -185,21 +186,16 @@ class MultiQueryAttention:
                     dtype=Q.dtype,
                     device=Q.device,
                 )
-        page_indexes = [pm["indexes"] for pm in pages_info]
 
         if x.device == torch.device("cuda"):
-            max_len = max(len(x) for x in page_indexes)
-            padded_indexes = torch.full(
-                (len(page_indexes), max_len),
-                fill_value=-1,   # padding value
-                dtype=torch.long,
-                device=x.device,
-            )
+
+            page_indexes = [torch.tensor(pm["indexes"], device=x.device) for pm in pages_info]
+            padded_indexes = pad_sequence(page_indexes,batch_first=True,padding_value=-1)
 
             attn_out = paged_mqa_decode(
                 q=Qh, K_cache=self.KV_cache.K, V_cache=self.KV_cache.V, out=out,
-                page_indexes = page_indexes,
-                KV_cache_block_cnt=self.KV_cache.blocks_cnt,
+                page_indexes = padded_indexes,
+                page_index_stride = padded_indexes.stride(0),
                 batch_size = len(uuid),
                 tok_cnt= torch.tensor([page["token_count"] for page in pages_info], device=Q.device),
                 seq_len_per_page=seq_len_per_page,

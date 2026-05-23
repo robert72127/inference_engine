@@ -6,7 +6,7 @@ import torch
 def paged_mqa_decode(
             q, K_cache, V_cache, out, 
             page_indexes,
-            KV_cache_block_cnt,
+            page_index_stride,
             batch_size,
             tok_cnt,
             seq_len_per_page,
@@ -19,7 +19,7 @@ def paged_mqa_decode(
     paged_mqa_decode_kernel[grid](
         q, K_cache, V_cache, out, 
         page_indexes, tok_cnt,
-        KV_cache_block_cnt,
+        page_index_stride,
         seq_len_per_page, 
         d_head=d_head,
         num_attn_heads=num_attn_heads,
@@ -33,7 +33,7 @@ def paged_mqa_decode(
 def paged_mqa_decode_kernel(
     q_ptr, K_cache, V_cache, out_ptr,
     page_indexes, tok_cnt,
-    KV_cache_block_cnt: tl.constexpr,
+    page_index_stride,
     seq_len_per_page: tl.constexpr,
     d_head: tl.constexpr,
     num_attn_heads: tl.constexpr,
@@ -47,7 +47,7 @@ def paged_mqa_decode_kernel(
     group_size = num_attn_heads // num_kv_heads
     kv_head_idx = head_idx // group_size
 
-    offs_t = tl.arange(0, BLOCK_T)
+    offst_t = tl.arange(0, BLOCK_T)
 
     tok_cnt = tl.load(tok_cnt + batch_idx)
     pages_cnt = tl.cdiv(tok_cnt, seq_len_per_page)
@@ -73,11 +73,11 @@ def paged_mqa_decode_kernel(
     m_max = -float("inf")
     l = 0
     acc = tl.zeros((BLOCK_D,), dtype=tl.float32)
-    scale = 1.0 / tl.sqrt(d_head)
+    scale = 1.0 / tl.sqrt(d_head + 0.0)
 
     i = 0
     while i < pages_cnt:
-        idx = tl.load(page_indexes + batch_idx + i)
+        idx = tl.load(page_indexes + batch_idx * page_index_stride + i)
         token_base = i * seq_len_per_page
         valid_mask = token_base + offst_t < tok_cnt
 
@@ -105,14 +105,14 @@ def paged_mqa_decode_kernel(
         scores = tl.sum(k_block * q_block[None, :], axis=1) * scale
         scores = tl.where(valid_mask, scores, -float("inf"))
 
-        m_block = tl.maximum(scores, axis=0)
+        m_block = tl.max(scores, axis=0)
         m_new = tl.maximum(m_max, m_block)
 
         old_rescale = tl.exp(m_max - m_new)
         
         m_max = m_new
-        weight = tl.exp(scores - m_max[:, None])
-        l = l * old_rescale + weight.sum(axis=1)
+        weight = tl.exp(scores - m_max)
+        l = l * old_rescale + tl.sum(weight, axis=0)
         acc = acc * old_rescale + tl.sum(weight[:, None] * v_block, axis=0)
 
         i += 1
