@@ -233,7 +233,7 @@ class MultiQueryAttention:
                 device=Qh.device,
             )
             tokens_seen = 0
-            K_pages,V_pages = self.KV_cache._get_pages(state["indexes"])
+            K_pages,V_pages = self.KV_cache.get_pages(state["indexes"])
             for k_block, v_block in zip(K_pages, V_pages):
                 valid_tokens = min(self.KV_cache.block_size, token_count - tokens_seen)
                 if valid_tokens <= 0:

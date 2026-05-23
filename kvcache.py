@@ -180,7 +180,7 @@ class RadixKVCache:
                 self.free_slots_cnt += 1
             self.uuids.pop(uuid)
 
-    def _get_pages(self, indexes):
+    def get_pages(self, indexes):
         K_ = [self.K[ind] for ind in indexes]
         V_ = [self.V[ind] for ind in indexes]
         return K_, V_
@@ -250,7 +250,7 @@ class RadixKVCache:
                 blocks_cnt = 1
 
             indexes = self.get_free_blocks(blocks_cnt)
-            pages_K, pages_V = self._get_pages(indexes)
+            pages_K, pages_V = self.get_pages(indexes)
 
             for j in range(remaining_tokens):
                 src_idx = cached_tokens + j

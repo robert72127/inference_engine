@@ -52,7 +52,7 @@ class KVCacheTests(unittest.TestCase):
         self.assertEqual(state["token_count"], 4)
         self.assertEqual(len(state["indexes"]), 2)
 
-        pages_k, pages_v = cache._get_pages(state["indexes"])
+        pages_k, pages_v = cache.get_pages(state["indexes"])
         self.assertTrue(torch.equal(pages_k[0][0, 0], prefill_k[0, 0, 0]))
         self.assertTrue(torch.equal(pages_k[0][0, 1], prefill_k[0, 0, 1]))
         self.assertTrue(torch.equal(pages_v[0][0, 0], prefill_v[0, 0, 0]))
