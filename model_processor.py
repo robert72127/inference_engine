@@ -20,19 +20,6 @@ class OP(Enum):
     PREFILL = 1
     GENERATE = 2
 
-class PrefillChunkSizer:
-    def __init__(self, default_chunk_size: int):
-        self.default_chunk_size = default_chunk_size
-
-    def get_chunk_size(self, batch: list["ServerHandle"], generating_cnt: int):
-        remaining_tokens = [handle.tokens.size(0) - handle.prefill_pos for handle in batch]
-        if generating_cnt == 0:
-            if len(batch) == 1:
-                return remaining_tokens[0]
-            if max(remaining_tokens) - min(remaining_tokens) <= self.default_chunk_size:
-                return max(remaining_tokens)
-        return self.default_chunk_size
-
 class ServerHandle:
     def __init__(
         self,
@@ -169,6 +156,19 @@ def start_model_process(endpoint: str, model_constructor, device, eos_token_id: 
         max_request_len=max_request_len,
     )
     asyncio.run(run_model_server(endpoint, processor))
+
+class PrefillChunkSizer:
+    def __init__(self, default_chunk_size: int):
+        self.default_chunk_size = default_chunk_size
+
+    def get_chunk_size(self, batch: list["ServerHandle"], generating_cnt: int):
+        remaining_tokens = [handle.tokens.size(0) - handle.prefill_pos for handle in batch]
+        if generating_cnt == 0:
+            if len(batch) == 1:
+                return remaining_tokens[0]
+            if max(remaining_tokens) - min(remaining_tokens) <= self.default_chunk_size:
+                return max(remaining_tokens)
+        return self.default_chunk_size
 
 class ModelProcessor:
     def __init__(
