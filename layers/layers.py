@@ -109,24 +109,8 @@ class MultiQueryAttention:
         else: return self._generate(x, tokens, uuid)
 
     def _prefill(self, x:torch.Tensor, tokens, mask, uuid):
-        Q = self.q_weights(x)
-        K = self.k_weights(x)
-        V = self.v_weights(x)
-        Q = Q + self.q_bias if self.q_bias is not None else Q
-        K = K + self.k_bias if self.k_bias is not None else K
-        V = V + self.v_bias if self.v_bias is not None else V
-        
-        Qh = rearrange(Q, "b l (h d) -> b h l d", h=self.num_attn_heads)
-        Kh = rearrange(K, "b l (h d) -> b h l d", h=self.num_kv_heads)
-        Vh = rearrange(V, "b l (h d) -> b h l d", h=self.num_kv_heads)
-
-        if self.rope is not None:
-            Qh = self.rope(Qh)
-            Kh = self.rope(Kh)
-
-        B, H_q, L, D = Qh.shape
-        _, H_kv, _, _ = Kh.shape
         full_len = tokens.size(1)
+        B = x.size(0)
         if mask is None:
             prompt_lens = torch.full((B,), full_len, device=tokens.device, dtype=torch.long)
         else:
@@ -136,35 +120,83 @@ class MultiQueryAttention:
             tokens[idx, : int(prompt_lens[idx].item())]
             for idx in range(B)
         ]
-        self.KV_cache.init(uuid, prompt_tokens)
+        init_info = self.KV_cache.init(uuid, prompt_tokens)
 
-        group = H_q // H_kv   # number of query heads per kv head
+        H_q = self.num_attn_heads
+        H_kv = self.num_kv_heads
+        D = self.head_dim
+        group = H_q // H_kv
         out_heads = torch.zeros(
-            (B, H_q, L, D),
-            device=Qh.device,
+            (B, H_q, full_len, D),
+            device=x.device,
             dtype=torch.float32,
         )
+        Kh = self.KV_cache.K.new_zeros((B, H_kv, full_len, D))
+        Vh = self.KV_cache.V.new_zeros((B, H_kv, full_len, D))
 
         for idx in range(B):
             seq_len = int(prompt_lens[idx].item())
             if seq_len <= 0:
                 continue
 
-            Qg = Qh[idx : idx + 1, :, :seq_len, :].view(1, H_kv, group, seq_len, D)
-            Kg = Kh[idx : idx + 1, :, :seq_len, :].unsqueeze(2)
-            Vg = Vh[idx : idx + 1, :, :seq_len, :].unsqueeze(2)
+            cached_blocks, cached_blocks_cnt = init_info[idx]
+            cached_tokens = min(cached_blocks_cnt * self.KV_cache.block_size, seq_len)
+            work_start = cached_tokens if cached_tokens < seq_len else seq_len - 1
+            work_len = seq_len - work_start
+            positions = torch.arange(work_start, seq_len, device=x.device).unsqueeze(0)
+            x_slice = x[idx : idx + 1, work_start:seq_len, :]
+
+            Q = self.q_weights(x_slice)
+            Q = Q + self.q_bias if self.q_bias is not None else Q
+            Qh = rearrange(Q, "b l (h d) -> b h l d", h=H_q)
+
+            if self.rope is not None:
+                Qh = self.rope(Qh, position=positions)
+
+            dense_k = self.KV_cache.K.new_zeros((1, H_kv, seq_len, D))
+            dense_v = self.KV_cache.V.new_zeros((1, H_kv, seq_len, D))
+
+            if cached_tokens > 0:
+                tokens_seen = 0
+                K_pages, V_pages = self.KV_cache.get_pages(cached_blocks)
+                for k_block, v_block in zip(K_pages, V_pages):
+                    valid_tokens = min(self.KV_cache.block_size, cached_tokens - tokens_seen)
+                    if valid_tokens <= 0:
+                        break
+                    dense_k[0, :, tokens_seen:tokens_seen + valid_tokens, :] = k_block[:, :valid_tokens, :]
+                    dense_v[0, :, tokens_seen:tokens_seen + valid_tokens, :] = v_block[:, :valid_tokens, :]
+                    tokens_seen += valid_tokens
+
+            if cached_tokens < seq_len:
+                suffix_x = x[idx : idx + 1, cached_tokens:seq_len, :]
+                K = self.k_weights(suffix_x)
+                V = self.v_weights(suffix_x)
+                K = K + self.k_bias if self.k_bias is not None else K
+                V = V + self.v_bias if self.v_bias is not None else V
+                fresh_k = rearrange(K, "b l (h d) -> b h l d", h=H_kv)
+                fresh_v = rearrange(V, "b l (h d) -> b h l d", h=H_kv)
+                if self.rope is not None:
+                    suffix_positions = torch.arange(cached_tokens, seq_len, device=x.device).unsqueeze(0)
+                    fresh_k = self.rope(fresh_k, position=suffix_positions)
+                dense_k[0, :, cached_tokens:seq_len, :] = fresh_k[0]
+                dense_v[0, :, cached_tokens:seq_len, :] = fresh_v[0]
+                Kh[idx, :, cached_tokens:seq_len, :] = fresh_k[0]
+                Vh[idx, :, cached_tokens:seq_len, :] = fresh_v[0]
+
+            Qg = Qh.view(1, H_kv, group, work_len, D)
+            Kg = dense_k.unsqueeze(2)
+            Vg = dense_v.unsqueeze(2)
             attn_scores = torch.matmul(Qg, Kg.transpose(-1, -2)) / math.sqrt(D)
-            causal = torch.triu(
-                torch.ones(seq_len, seq_len, device=attn_scores.device, dtype=torch.bool),
-                diagonal=1,
-            )
-            attn_scores = attn_scores.masked_fill(causal.view(1, 1, 1, seq_len, seq_len), float("-inf"))
+            query_positions = torch.arange(work_start, seq_len, device=x.device)
+            key_positions = torch.arange(seq_len, device=x.device)
+            causal = key_positions.unsqueeze(0) > query_positions.unsqueeze(1)
+            attn_scores = attn_scores.masked_fill(causal.view(1, 1, 1, work_len, seq_len), float("-inf"))
             attn = attn_scores.softmax(dim=-1)
             out_g = torch.matmul(attn, Vg)
-            out_heads[idx, :, :seq_len, :] = rearrange(out_g, "b h_kv g l d -> b (h_kv g) l d")[0]
+            out_heads[idx, :, work_start:seq_len, :] = rearrange(out_g, "b h_kv g l d -> b (h_kv g) l d")[0]
 
         self.KV_cache.prefill(uuid, tokens, Kh, Vh, mask)
-        out = self.outproj(rearrange(out_heads.to(Qh.dtype), "b h l d -> b l (h d)"))
+        out = self.outproj(rearrange(out_heads.to(x.dtype), "b h l d -> b l (h d)"))
         return out
 
     def _generate(self, x:torch.Tensor, tokens, uuid):

@@ -36,19 +36,19 @@ class FakeConcurrentModel:
         self.generate_calls = 0
         self.kv_caches = [self.FakeCache()]
 
-    def __call__(self, input_ids, tokens, prefill, mask, uuid):
-        batch, seq_len = input_ids.shape
+    def __call__(self, input_ids, tokens, prefill, mask, lengths, uuid):
+        batch = input_ids.shape[0]
         logits = torch.full(
-            (batch, seq_len, self.vocab_size),
+            (batch, self.vocab_size),
             -1000.0,
             device=self.device,
         )
         if prefill:
-            logits[:, :, 1] = 0.0
+            logits[:, 1] = 0.0
         else:
             self.generate_calls += 1
             next_token = 2 if self.generate_calls == 1 else 7
-            logits[:, :, next_token] = 0.0
+            logits[:, next_token] = 0.0
         return logits
 
 class DecodeBatchTests(unittest.TestCase):
@@ -57,7 +57,7 @@ class DecodeBatchTests(unittest.TestCase):
 
     def test_decode_batch_uses_greedy_when_temperature_is_zero(self):
         logits = torch.tensor(
-            [[[0.1, 0.9, 0.0]], [[0.8, 0.1, 0.1]]],
+            [[0.1, 0.9, 0.0], [0.8, 0.1, 0.1]],
             dtype=torch.float32,
         )
         batch = [
@@ -72,7 +72,7 @@ class DecodeBatchTests(unittest.TestCase):
     def test_decode_batch_keeps_batch_shape_for_sampling(self):
         torch.manual_seed(0)
         logits = torch.tensor(
-            [[[0.1, 0.9, 0.0]], [[0.8, 0.1, 0.1]]],
+            [[0.1, 0.9, 0.0], [0.8, 0.1, 0.1]],
             dtype=torch.float32,
         )
         batch = [
@@ -88,7 +88,7 @@ class DecodeBatchTests(unittest.TestCase):
     def test_decode_batch_supports_mixed_sampling_params(self):
         torch.manual_seed(0)
         logits = torch.tensor(
-            [[[0.1, 0.9, 0.0]], [[0.8, 0.1, 0.1]]],
+            [[0.1, 0.9, 0.0], [0.8, 0.1, 0.1]],
             dtype=torch.float32,
         )
         batch = [
@@ -156,7 +156,7 @@ class ModelProcessorConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         while not handle.token_q.empty():
             tokens.append(handle.token_q.get_nowait())
 
-        self.assertEqual(tokens, [1, 7])
+        self.assertEqual(tokens, [1])
         self.assertEqual(processor.model.generate_calls, 0)
 
     async def test_prefill_rejects_prompt_longer_than_kv_cache_limit(self):
@@ -179,13 +179,13 @@ class ModelProcessorConcurrencyTests(unittest.IsolatedAsyncioTestCase):
                 self.kv_caches = [self.FakeCache(total_blocks=3, block_size=2)]
                 self.prefill_batch_sizes = []
 
-            def __call__(self, input_ids, tokens, prefill, mask, uuid):
+            def __call__(self, input_ids, tokens, prefill, mask, lengths, uuid):
                 if prefill:
                     self.prefill_batch_sizes.append(input_ids.size(0))
-                logits = super().__call__(input_ids, tokens, prefill, mask, uuid)
+                logits = super().__call__(input_ids, tokens, prefill, mask, lengths, uuid)
                 if not prefill:
-                    logits[:, :, :] = -1000.0
-                    logits[:, :, 7] = 0.0
+                    logits[:, :] = -1000.0
+                    logits[:, 7] = 0.0
                 return logits
 
         processor = ModelProcessor(
