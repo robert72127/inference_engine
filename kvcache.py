@@ -19,7 +19,11 @@ class RadixTree:
 
     def add_node(self, uuid, node):
         self.uuid_to_last_node[uuid] = node
-        
+
+    #todo
+    def remove_node(self, Node):
+        pass
+
     def insert(self, uuid, block_idx, key):
         node = self.get_last_node(uuid)
         for child in node.children:
@@ -110,7 +114,6 @@ class RadixKVCache:
             self.write_block_toks.append(int(tok.item()) if torch.is_tensor(tok) else int(tok))
             self.write_block_occupancy+=1
 
-      
     def __init__(self, d_head, head_cnt, num_blocks, block_size, max_requests_per_uuid=None, device=None, dtype=None):
         self.d_head = d_head
         self.head_cnt = head_cnt
@@ -181,19 +184,6 @@ class RadixKVCache:
                 self.free_slots_cnt += 1
             self.uuids.pop(uuid)
 
-    def get_pages(self, indexes):
-        K_ = [self.K[ind] for ind in indexes]
-        V_ = [self.V[ind] for ind in indexes]
-        return K_, V_
-
-    def _block_keys_for_tokens(self, toks):
-        if torch.is_tensor(toks):
-            toks = toks.tolist()
-        return [
-            toks[i:i + self.block_size]
-            for i in range(0, len(toks) - len(toks) % self.block_size, self.block_size)
-        ]
-
     def _register_resident_block(self, block):
         self.resident_blocks.add(block)
         self.resident_lru.pop(block, None)
@@ -214,6 +204,19 @@ class RadixKVCache:
         if node is not None and node.parent is not None:
             node.parent.children = [child for child in node.parent.children if child is not node]
         return block
+
+    def get_pages(self, indexes):
+        K_ = [self.K[ind] for ind in indexes]
+        V_ = [self.V[ind] for ind in indexes]
+        return K_, V_
+
+    def _block_keys_for_tokens(self, toks):
+        if torch.is_tensor(toks):
+            toks = toks.tolist()
+        return [
+            toks[i:i + self.block_size]
+            for i in range(0, len(toks) - len(toks) % self.block_size, self.block_size)
+        ]
 
     def get_q_position(self, uuids):
         positions = []
