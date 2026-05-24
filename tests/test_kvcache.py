@@ -24,8 +24,7 @@ class KVCacheTests(unittest.TestCase):
         prefill_v = prefill_k + 10.0
         mask = torch.tensor([[True, True, True]])
 
-        init_info = cache.init((11,), prefill_tokens)
-        self.assertEqual(init_info, [([], 0)])
+        cache.init((11,), prefill_tokens)
 
         cache.prefill((11,), prefill_tokens, prefill_k, prefill_v, mask)
         self.assertTrue(torch.equal(cache.get_q_position((11,)), torch.tensor([[3]])))
@@ -33,14 +32,14 @@ class KVCacheTests(unittest.TestCase):
         cache.release((11,))
 
         reuse_tokens = torch.tensor([[11, 12, 21]])
-        reuse_k = torch.tensor([[[[101.0, 102.0, 103.0, 104.0], [105.0, 106.0, 107.0, 108.0], [109.0, 110.0, 111.0, 112.0]]]])
+        reuse_chunk_tokens = torch.tensor([[21]])
+        reuse_k = torch.tensor([[[[109.0, 110.0, 111.0, 112.0]]]])
         reuse_v = reuse_k + 10.0
 
-        init_info = cache.init((22,), reuse_tokens)
-        self.assertEqual(len(init_info[0][0]), 1)
-        self.assertEqual(init_info[0][1], 1)
+        cache.init((22,), reuse_tokens)
+        self.assertEqual(len(cache.uuids[22].commited_blocks), 1)
 
-        cache.prefill((22,), reuse_tokens, reuse_k, reuse_v, mask)
+        cache.prefill((22,), reuse_chunk_tokens, reuse_k, reuse_v, torch.tensor([[True]]))
         self.assertTrue(torch.equal(cache.get_q_position((22,)), torch.tensor([[3]])))
 
         append_k = torch.tensor([[[[201.0, 202.0, 203.0, 204.0]]]])
@@ -56,7 +55,7 @@ class KVCacheTests(unittest.TestCase):
         self.assertTrue(torch.equal(pages_k[0][0, 0], prefill_k[0, 0, 0]))
         self.assertTrue(torch.equal(pages_k[0][0, 1], prefill_k[0, 0, 1]))
         self.assertTrue(torch.equal(pages_v[0][0, 0], prefill_v[0, 0, 0]))
-        self.assertTrue(torch.equal(pages_k[1][0, 0], reuse_k[0, 0, 2]))
+        self.assertTrue(torch.equal(pages_k[1][0, 0], reuse_k[0, 0, 0]))
         self.assertTrue(torch.equal(pages_k[1][0, 1], append_k[0, 0, 0]))
 
     def test_init_only_reuses_full_blocks(self):
@@ -72,8 +71,8 @@ class KVCacheTests(unittest.TestCase):
         cache.release((7,))
 
         shorter_tokens = torch.tensor([[1]])
-        init_info = cache.init((9,), shorter_tokens)
-        self.assertEqual(init_info, [([], 0)])
+        cache.init((9,), shorter_tokens)
+        self.assertEqual(cache.uuids[9].commited_blocks, [])
 
     def test_release_after_init_without_prefill_is_safe(self):
         cache = self.make_cache()
@@ -82,6 +81,40 @@ class KVCacheTests(unittest.TestCase):
         cache.release((123,))
 
         self.assertNotIn(123, cache.uuids)
+
+    def test_prefill_reuses_existing_write_block_across_chunks(self):
+        cache = self.make_cache(d_head=2, num_blocks=6, block_size=2)
+
+        full_tokens = torch.tensor([[10, 11, 12]])
+        cache.init((5,), full_tokens)
+
+        chunk_1_toks = torch.tensor([[10]])
+        chunk_1_k = torch.tensor([[[[1.0, 2.0]]]])
+        chunk_1_v = chunk_1_k + 10.0
+        cache.prefill((5,), chunk_1_toks, chunk_1_k, chunk_1_v, torch.tensor([[True]]))
+
+        state = cache.uuids[5]
+        self.assertEqual(state.commited_blocks, [])
+        self.assertEqual(state.write_block_occupancy, 1)
+        first_write_block = state.write_block
+
+        chunk_2_toks = torch.tensor([[11, 12]])
+        chunk_2_k = torch.tensor([[[[3.0, 4.0], [5.0, 6.0]]]])
+        chunk_2_v = chunk_2_k + 10.0
+        cache.prefill((5,), chunk_2_toks, chunk_2_k, chunk_2_v, torch.tensor([[True, True]]))
+
+        state = cache.uuids[5]
+        self.assertEqual(len(state.commited_blocks), 1)
+        self.assertEqual(state.commited_blocks[0], first_write_block)
+        self.assertEqual(state.write_block_occupancy, 1)
+        self.assertEqual(state.write_block_toks, [12])
+        self.assertTrue(torch.equal(cache.get_q_position((5,)), torch.tensor([[3]])))
+
+        pages_k, pages_v = cache.get_pages([state.commited_blocks[0], state.write_block])
+        self.assertTrue(torch.equal(pages_k[0][0, 0], chunk_1_k[0, 0, 0]))
+        self.assertTrue(torch.equal(pages_k[0][0, 1], chunk_2_k[0, 0, 0]))
+        self.assertTrue(torch.equal(pages_v[0][0, 1], chunk_2_v[0, 0, 0]))
+        self.assertTrue(torch.equal(pages_k[1][0, 0], chunk_2_k[0, 0, 1]))
 
 
 if __name__ == "__main__":

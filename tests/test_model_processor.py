@@ -3,7 +3,8 @@ import unittest
 
 import torch
 
-from model_processor import ModelProcessor, ServerHandle
+from model_processor import ModelProcessor, OP, PrefillChunkSizer, ServerHandle
+from models.model import ModelForwardState
 
 
 class FakeConcurrentModel:
@@ -34,16 +35,18 @@ class FakeConcurrentModel:
         self.device = torch.device(device)
         self.vocab_size = 8
         self.generate_calls = 0
+        self.prefill_last_chunk_calls = []
         self.kv_caches = [self.FakeCache()]
 
-    def __call__(self, input_ids, tokens, prefill, mask, lengths, uuid):
+    def __call__(self, input_ids, state: ModelForwardState):
         batch = input_ids.shape[0]
         logits = torch.full(
             (batch, self.vocab_size),
             -1000.0,
             device=self.device,
         )
-        if prefill:
+        if state.prefill:
+            self.prefill_last_chunk_calls.append(state.prefill_last_chunk.tolist())
             logits[:, 1] = 0.0
         else:
             self.generate_calls += 1
@@ -100,6 +103,59 @@ class DecodeBatchTests(unittest.TestCase):
 
         self.assertEqual(tuple(out.shape), (2,))
         self.assertEqual(out[0].item(), 1)
+
+
+class PrefillChunkSizerTests(unittest.TestCase):
+    def setUp(self):
+        self.processor = ModelProcessor.__new__(ModelProcessor)
+        self.processor.device = torch.device("cpu")
+        self.processor.prefill_chunk_sizer = PrefillChunkSizer(default_chunk_size=2)
+        self.processor.kv_caches = [FakeConcurrentModel.FakeCache(block_size=2)]
+        self.processor.prefill_waiting = []
+        self.processor.generating = []
+
+    def test_make_batch_uses_full_remaining_prompt_for_single_request_without_waiters(self):
+        handle = ServerHandle(0, torch.tensor([11, 12, 13]), temperature=0.0, top_p=1.0, max_new_tokens=1)
+
+        input_ids, state = self.processor._make_batch([handle], OP.PREFILL)
+
+        self.assertTrue(torch.equal(input_ids, torch.tensor([[11, 12, 13]])))
+        self.assertTrue(torch.equal(state.lengths, torch.tensor([3])))
+        self.assertTrue(torch.equal(state.prefill_last_chunk, torch.tensor([True])))
+
+    def test_make_batch_uses_block_sized_chunks_when_other_prefill_waiters_exist(self):
+        handle = ServerHandle(0, torch.tensor([11, 12, 13]), temperature=0.0, top_p=1.0, max_new_tokens=1)
+        self.processor.generating = [ServerHandle(1, torch.tensor([21]), temperature=0.0, top_p=1.0, max_new_tokens=1)]
+
+        input_ids, state = self.processor._make_batch([handle], OP.PREFILL)
+
+        self.assertTrue(torch.equal(input_ids, torch.tensor([[11, 12]])))
+        self.assertTrue(torch.equal(state.lengths, torch.tensor([2])))
+        self.assertTrue(torch.equal(state.prefill_last_chunk, torch.tensor([False])))
+
+    def test_make_batch_uses_full_chunk_for_similar_prefill_batch_when_generate_is_empty(self):
+        batch = [
+            ServerHandle(0, torch.tensor([11, 12, 13]), temperature=0.0, top_p=1.0, max_new_tokens=1),
+            ServerHandle(1, torch.tensor([21, 22]), temperature=0.0, top_p=1.0, max_new_tokens=1),
+        ]
+
+        input_ids, state = self.processor._make_batch(batch, OP.PREFILL)
+
+        self.assertTrue(torch.equal(input_ids, torch.tensor([[11, 12, 13], [21, 22, 0]])))
+        self.assertTrue(torch.equal(state.lengths, torch.tensor([3, 2])))
+        self.assertTrue(torch.equal(state.prefill_last_chunk, torch.tensor([True, True])))
+
+    def test_make_batch_uses_default_chunk_for_dissimilar_prefill_batch(self):
+        batch = [
+            ServerHandle(0, torch.tensor([11, 12, 13, 14, 15]), temperature=0.0, top_p=1.0, max_new_tokens=1),
+            ServerHandle(1, torch.tensor([21, 22]), temperature=0.0, top_p=1.0, max_new_tokens=1),
+        ]
+
+        input_ids, state = self.processor._make_batch(batch, OP.PREFILL)
+
+        self.assertTrue(torch.equal(input_ids, torch.tensor([[11, 12], [21, 22]])))
+        self.assertTrue(torch.equal(state.lengths, torch.tensor([2, 2])))
+        self.assertTrue(torch.equal(state.prefill_last_chunk, torch.tensor([False, True])))
 
 
 class ModelProcessorConcurrencyTests(unittest.IsolatedAsyncioTestCase):
@@ -179,11 +235,11 @@ class ModelProcessorConcurrencyTests(unittest.IsolatedAsyncioTestCase):
                 self.kv_caches = [self.FakeCache(total_blocks=3, block_size=2)]
                 self.prefill_batch_sizes = []
 
-            def __call__(self, input_ids, tokens, prefill, mask, lengths, uuid):
-                if prefill:
+            def __call__(self, input_ids, state: ModelForwardState):
+                if state.prefill:
                     self.prefill_batch_sizes.append(input_ids.size(0))
-                logits = super().__call__(input_ids, tokens, prefill, mask, lengths, uuid)
-                if not prefill:
+                logits = super().__call__(input_ids, state)
+                if not state.prefill:
                     logits[:, :] = -1000.0
                     logits[:, 7] = 0.0
                 return logits
@@ -202,3 +258,29 @@ class ModelProcessorConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0.1)
 
         self.assertEqual(processor.model.prefill_batch_sizes, [1, 1])
+
+    async def test_prefill_requeues_until_last_chunk(self):
+        processor = ModelProcessor(
+            FakeConcurrentModel,
+            torch.device("cpu"),
+            eos_token_id=7,
+            max_request_len=8,
+            max_batch_prefill=8,
+            max_batch_generate=8,
+        )
+
+        handle_ids = await asyncio.gather(
+            processor.prefill([11, 12, 13], temperature=0.0, top_p=1.0),
+            processor.prefill([21], temperature=0.0, top_p=1.0),
+        )
+        handle = processor.handles[handle_ids[0]]
+        await asyncio.sleep(0.1)
+
+        self.assertTrue(any(row == [True] for row in processor.model.prefill_last_chunk_calls))
+
+        tokens = []
+        while not handle.token_q.empty():
+            tokens.append(handle.token_q.get_nowait())
+
+        self.assertGreaterEqual(len(tokens), 1)
+        self.assertEqual(tokens[0], 1)
