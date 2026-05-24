@@ -75,6 +75,14 @@ class KVCacheTests(unittest.TestCase):
         init_info = cache.init((9,), shorter_tokens)
         self.assertEqual(init_info, [([], 0)])
 
+    def test_release_after_init_without_prefill_is_safe(self):
+        cache = self.make_cache()
+
+        cache.init((123,), torch.tensor([[1, 2, 3]]))
+        cache.release((123,))
+
+        self.assertNotIn(123, cache.uuids)
+
 
 if __name__ == "__main__":
     unittest.main()

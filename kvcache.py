@@ -1,5 +1,4 @@
 from collections import deque
-from collections import OrderedDict
 import torch
 
 def blocks_for_tokens(token_count: int, block_size: int):
@@ -25,18 +24,24 @@ class RadixTree:
     def remove_node(self, node):
         if node == self.root:
             return
-        for child in node.children:
+        for uuid, last_node in list(self.uuid_to_last_node.items()):
+            current = last_node
+            while current is not None:
+                if current is node:
+                    self.uuid_to_last_node[uuid] = self.root
+                    break
+                current = current.parent
+        for child in list(node.children):
             self.remove_node(child)
         if node.parent:
-            node.parent.children.remove(node)
-        del node
+            node.parent.children = [child for child in node.parent.children if child is not node]
 
     def insert(self, uuid, block_idx, key):
         node = self.get_last_node(uuid)
         for child in node.children:
             if child.key == key:
                 self.uuid_to_last_node[uuid] = child
-                return child.page_id
+                return child
         new_node = self.RadixNode(page_id=block_idx, key=key)
         new_node.parent = node
         node.children.append(new_node)
@@ -74,36 +79,30 @@ class BlockAllocator:
         for block in blocks:
             if block in self.evictable_blocks:
                 self.evictable_blocks.remove(block)
-                self.locked_slots[block] =  1
+                self.locked_slots[block] = 1
             else:
-                self.locked_slots[block] +=  1
+                self.locked_slots[block] = self.locked_slots.get(block, 0) + 1
 
     def free_blocks(self, blocks):
         # by traversing in revese order lower nodes from radix will be evicted first
         for block in reversed(blocks):
+            if block is None or block not in self.locked_slots:
+                continue
             self.locked_slots[block] -= 1
             if self.locked_slots[block] == 0:
                 del self.locked_slots[block]
-                self.evictable_blocks.add(block)
-
-    def get_blocks_available(self):
-        reserved=0
-        for uuid in self.uuids:
-            uuid_state = self.uuids[uuid]
-            reserved += self.max_requests_per_uuid - uuid_state.blocks_count
-        
-        return self.free_slots_cnt + len(self.evictable_blocks) - reserved
+                self.evictable_blocks.append(block)
 
     def get_free_blocks(self, block_cnt=1):
         blocks = []
-        if self.free_slots:
-           block = self.free_slots.popleft()
-           self.free_slots_cnt -= 1
-           blocks.append(block)
-        block_cnt -= len(blocks)
-        for _ in range(block_cnt):
+        while len(blocks) < block_cnt and self.free_slots:
+            block = self.free_slots.popleft()
+            self.free_slots_cnt -= 1
+            blocks.append(block)
+        while len(blocks) < block_cnt:
             blocks.append(self.evictable_blocks.popleft())
         return blocks
+
 
 class RadixKVCache:
     class UUIDState:
@@ -177,8 +176,8 @@ class RadixKVCache:
     # might return different index if block is already present, then this block will be auto freed, and found block lock_count will be incremented
     def radix_insert(self, uuid, block_idx, toks):
         new_node = self.radix_tree.insert(uuid, block_idx, toks) 
-        self.block_to_node[block_idx] = new_node
         new_block_idx = new_node.page_id
+        self.block_to_node[new_block_idx] = new_node
         if new_block_idx != block_idx:
             self.block_allocator.free_blocks([block_idx])
         return new_block_idx
@@ -193,7 +192,9 @@ class RadixKVCache:
 
     def _release(self, uuid):
         uuid_state = self.uuids.pop(uuid, None)
-        
+        if uuid_state is None:
+            self.radix_tree.remove_uuid(uuid)
+            return
         self.radix_tree.remove_uuid(uuid)
 
         blocks = uuid_state.commited_blocks + [uuid_state.write_block]
@@ -209,14 +210,28 @@ class RadixKVCache:
         for block in blocks:
             if block in self.block_to_node:
                 node = self.block_to_node.pop(block)
+                self._drop_subtree_refs([node])
                 self.radix_tree.remove_node(node)
         self.block_allocator.incr_lock_count(blocks)
         return blocks
+
+    def _drop_subtree_refs(self, nodes):
+        stack = list(nodes)
+        while stack:
+            node = stack.pop()
+            stack.extend(node.children)
+            self.block_to_node.pop(node.page_id, None)
 
     def get_pages(self, indexes):
         K_ = [self.K[ind] for ind in indexes]
         V_ = [self.V[ind] for ind in indexes]
         return K_, V_
+
+    def get_blocks_available(self):
+        reserved = 0
+        for uuid_state in self.uuids.values():
+            reserved += self.max_requests_per_uuid - uuid_state.blocks_count
+        return self.block_allocator.free_slots_cnt + len(self.block_allocator.evictable_blocks) - reserved
 
     def _block_keys_for_tokens(self, toks):
         if torch.is_tensor(toks):
@@ -261,7 +276,7 @@ class RadixKVCache:
             if blocks_cnt == 0:
                 blocks_cnt = 1
 
-            indexes = self.get_free_blocks(blocks_cnt)
+            indexes = self.allocate_blocks(blocks_cnt)
             pages_K, pages_V = self.get_pages(indexes)
 
             for j in range(remaining_tokens):
@@ -307,4 +322,3 @@ class RadixKVCache:
             batch_size += 1
             pages_info += [uuid_state.get_pages_info()]
         return pages_info
-
