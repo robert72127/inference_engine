@@ -77,8 +77,19 @@ async def lifespan(app: FastAPI):
     max_workers = int(os.getenv("MODEL_MAX_WORKERS", "1"))
     max_proc_req = int(os.getenv("MODEL_MAX_PROC_REQ", "100"))
     max_cache_seq_len = int(os.getenv("MODEL_MAX_CACHE_SEQ_LEN", "4096"))
-    app.state.engine = Engine(model=model, backend=backend, max_workers=max_workers,
-        max_proc_req=max_proc_req,max_cache_seq_len=max_cache_seq_len,)
+    cpu_reserve_gb = float(os.getenv("MODEL_CPU_RESERVE_GB", "6"))
+    cuda_memory_fraction = float(os.getenv("MODEL_CUDA_MEMORY_FRACTION", "1.0"))
+    prefill_chunk_size = os.getenv("MODEL_PREFILL_CHUNK_SIZE")
+    app.state.engine = Engine(
+        model=model,
+        backend=backend,
+        max_workers=max_workers,
+        max_proc_req=max_proc_req,
+        max_cache_seq_len=max_cache_seq_len,
+        cpu_reserve_gb=cpu_reserve_gb,
+        cuda_memory_fraction=cuda_memory_fraction,
+        prefill_chunk_size=None if prefill_chunk_size is None else int(prefill_chunk_size),
+    )
     yield
 
 

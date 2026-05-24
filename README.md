@@ -33,12 +33,15 @@ MODEL_BACKEND=cpu
 MODEL_MAX_WORKERS=1
 MODEL_MAX_PROC_REQ=100
 MODEL_MAX_CACHE_SEQ_LEN=4096
+MODEL_CPU_RESERVE_GB=6
+MODEL_CUDA_MEMORY_FRACTION=1.0
+MODEL_PREFILL_CHUNK_SIZE=256
 ```
 
 Example:
 
 ```bash
-MODEL_BACKEND=cpu uv run uvicorn api_server:app --host 0.0.0.0 --port 8000
+MODEL_BACKEND=cpu MODEL_CPU_RESERVE_GB=8 uv run uvicorn api_server:app --host 0.0.0.0 --port 8000
 ```
 
 ## API

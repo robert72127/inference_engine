@@ -10,6 +10,7 @@ from model_processor import ModelProcessor
 from models import MODEL, models
 
 CPU_SYSTEM_RESERVE_GB = 6
+CUDA_MEMORY_FRACTION = 1.0
 
 class BACKEND(Enum):
     CPU = "cpu"
@@ -33,10 +34,16 @@ class Engine:
         max_workers=1,
         max_proc_req=100,
         max_cache_seq_len=4096,
+        cpu_reserve_gb=CPU_SYSTEM_RESERVE_GB,
+        cuda_memory_fraction=CUDA_MEMORY_FRACTION,
+        prefill_chunk_size=None,
     ):
         # detect backend and init
         self.backend = backend if backend.is_available() else BACKEND.CPU
         self.model = model
+        self.cpu_reserve_gb = cpu_reserve_gb
+        self.cuda_memory_fraction = cuda_memory_fraction
+        self.prefill_chunk_size = prefill_chunk_size
         
         self.model_workers_cnt = self.backend.get_device_count(max_workers)
 
@@ -55,12 +62,23 @@ class Engine:
         self.tokenizer =  Tokenizer(model_dir=model_dir)
         eos_token_id = self.tokenizer.tokenizer.eos_token_id
 
-        Logger.info(f"Launching model : {self.model.value}, with backend : {self.backend.value}, num workers : {self.model_workers_cnt}") 
+        Logger.info(
+            "Launching model=%s backend=%s workers=%d max_proc_req=%d max_cache_seq_len=%d cpu_reserve_gb=%s cuda_memory_fraction=%s prefill_chunk_size=%s",
+            self.model.value,
+            self.backend.value,
+            self.model_workers_cnt,
+            max_proc_req,
+            max_cache_seq_len,
+            self.cpu_reserve_gb,
+            self.cuda_memory_fraction,
+            self.prefill_chunk_size,
+        )
         self.workers = [
             ModelProcessor(model_factory,
                 torch.device(self.backend.value if self.backend == BACKEND.CPU else f"{self.backend.value}:{worker_index}"),
                 eos_token_id=eos_token_id,
                 max_request_len=max_cache_seq_len,
+                prefill_chunk_size=prefill_chunk_size,
             )
             for worker_index in range(self.model_workers_cnt)
         ]
@@ -73,13 +91,13 @@ class Engine:
                 pages = os.sysconf("SC_PHYS_PAGES")
                 page_size = os.sysconf("SC_PAGE_SIZE")
                 total_memory = pages * page_size
-                reserve = CPU_SYSTEM_RESERVE_GB * 1024**3
+                reserve = self.cpu_reserve_gb * 1024**3
                 return max(0, total_memory - reserve) // self.model_workers_cnt
             case BACKEND.CUDA:
-                return min(
+                return int(min(
                     torch.cuda.get_device_properties(worker_index).total_memory
                     for worker_index in range(self.model_workers_cnt)
-                )
+                ) * self.cuda_memory_fraction)
 
     def apply_prompt_template(self, prompt: str):
         return f"<|im_start|>system\nYou are a helpful assistant answer .<|im_end|>\n<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
