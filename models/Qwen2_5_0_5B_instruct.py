@@ -232,10 +232,10 @@ def parse_model(
                 case _: raise Exception("Unknown layer, aborting")
         model += [(TransformerBlock(mlp, input_layernorm, self_attn, post_attention_layernorm), True)] 
 
-    model += [(output_norm, False), ( output_embed, False)]
+    output_layers = [output_norm, output_embed]
 
 
-    return model, kv_caches
+    return model, output_layers, kv_caches
 
 class Qwen2_5_0_5B_Instruct(Model):
     model_dir = model_dir
@@ -253,7 +253,7 @@ class Qwen2_5_0_5B_Instruct(Model):
         model_cfg = ModelConfig(cfg)
         self.device = torch.device(device)
         self.model_dir = model_dir 
-        self.layers, self.kv_caches = parse_model(
+        self.layers, self.output_layers, self.kv_caches = parse_model(
             model_file,
             model_cfg,
             self.device,
@@ -263,7 +263,7 @@ class Qwen2_5_0_5B_Instruct(Model):
         )
   
     @torch.inference_mode()
-    def __call__(self, input, tokens, prefill, mask, uuid):
+    def __call__(self, input, tokens, prefill, mask, lengths, uuid):
         tokens = tokens.to(self.device)
         mask = None if mask is None else mask.to(self.device)
         out = input.to(self.device)
@@ -274,6 +274,12 @@ class Qwen2_5_0_5B_Instruct(Model):
                 if is_transformer
                 else layer(out)
             )
+        if lengths is not None:
+            out = out[torch.arange(out.size(0)), lengths - 1]
+        else:
+            out = out[:, -1, :]
+        for layer in self.output_layers:
+            out = layer(out)
         return out
 
 if __name__ == '__main__':

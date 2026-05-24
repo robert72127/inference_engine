@@ -264,7 +264,7 @@ class ModelProcessor:
                 padding_value=0,
             )
             mask = torch.arange(input_ids.size(1), device=self.device)[None, :] < lengths[:, None]
-            return handle_ids, input_ids, mask
+            return handle_ids, input_ids, mask, lengths
 
         else:
             input_ids = torch.tensor(
@@ -272,7 +272,7 @@ class ModelProcessor:
                 device=self.device,
                 dtype=torch.long,
             ).unsqueeze(1)
-            return handle_ids, input_ids, None
+            return handle_ids, input_ids, None, None
     
     def worker_loop(self):
         next_op = OP.PREFILL
@@ -333,9 +333,9 @@ class ModelProcessor:
                 self.in_flight.update(handle.id for handle in batch)
 
             with torch.inference_mode():
-                handle_ids, input_ids, mask = self._make_batch(batch, op)
+                handle_ids, input_ids, mask, lengths = self._make_batch(batch, op)
                 request_key = tuple(handle_ids)
-                logits = self.model(input_ids, input_ids, op == OP.PREFILL, mask, request_key)
+                logits = self.model(input_ids, input_ids, op == OP.PREFILL, mask, lengths, request_key)
                 results = self._decode_batch(logits, batch)
                 results = results.tolist()
 
@@ -363,9 +363,6 @@ class ModelProcessor:
                 next_op = OP.GENERATE if op == OP.PREFILL else OP.PREFILL
 
     def _decode_batch(self, logits: torch.Tensor, batch: list[ServerHandle]) -> torch.Tensor:
-        if logits.dim() == 3:
-            logits = logits[:, -1, :]
-
         tokens = []
         for idx, handle in enumerate(batch):
             if handle.temperature == 0.0:
@@ -381,14 +378,10 @@ class ModelProcessor:
         return torch.stack(tokens)
 
     def _get_max_available_occupancy_left(self):
-        if not self.kv_caches:
-            return 0
         max_blocks_per_request = blocks_for_tokens(self.max_request_len, self.kv_caches[0].block_size)
         return max(0, self.kv_caches[0].get_blocks_available() // max_blocks_per_request)
 
     def _get_max_generate_batch_size(self):
-        if not self.generating:
-            return 0
         return min(self.max_batch_generate, len(self.generating))
 
     def _release_caches(self, handle_id: int):

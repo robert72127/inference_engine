@@ -9,7 +9,7 @@ from tokenizer import Tokenizer
 from model_processor import ModelProcessor
 from models import MODEL, models
 
-CPU_SYSTEM_RESERVE_GB = 4
+CPU_SYSTEM_RESERVE_GB = 6
 
 class BACKEND(Enum):
     CPU = "cpu"
