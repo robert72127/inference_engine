@@ -307,7 +307,15 @@ class ModelProcessor:
             with torch.inference_mode():
                 handle_ids, input_ids, mask, lengths = self._make_batch(batch, op)
                 request_key = tuple(handle_ids)
-                logits = self.model(input_ids, input_ids, op == OP.PREFILL, mask, lengths, request_key)
+                logits = self.model(
+                    input_ids,
+                    input_ids,
+                    op == OP.PREFILL,
+                    mask,
+                    lengths,
+                    request_key,
+                    prefill_last_chunk=True,
+                )
                 results = self._decode_batch(logits, batch)
                 results = results.tolist()
 

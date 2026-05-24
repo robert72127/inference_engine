@@ -263,7 +263,7 @@ class Qwen2_5_0_5B_Instruct(Model):
         )
   
     @torch.inference_mode()
-    def __call__(self, input, tokens, prefill, mask, lengths, uuid):
+    def __call__(self, input, tokens, prefill, mask, lengths, uuid, prefill_last_chunk=True):
         tokens = tokens.to(self.device)
         mask = None if mask is None else mask.to(self.device)
         out = input.to(self.device)
@@ -278,6 +278,8 @@ class Qwen2_5_0_5B_Instruct(Model):
             out = out[torch.arange(out.size(0)), lengths - 1]
         else:
             out = out[:, -1, :]
+        if prefill and not prefill_last_chunk:
+            return out
         for layer in self.output_layers:
             out = layer(out)
         return out

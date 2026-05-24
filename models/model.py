@@ -6,7 +6,10 @@ import torch
 class Model(ABC):
     def __init__(self, device: torch.device):
         pass
-    def __call__(self, input, tokens, prefill, mask, uuid):
+    @abstractmethod
+    def __call__(self, input, tokens, prefill, mask, lengths, uuid, prefill_last_chunk):
         pass
+
+    @abstractmethod
     def get_model_dir(self):
         pass
