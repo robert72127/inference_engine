@@ -8,6 +8,60 @@ def blocks_for_tokens(token_count: int, block_size: int):
         blocks_cnt += 1
     return blocks_cnt
 
+class RadixTree:
+    def __init__(self, kv_cache):
+        self.root = self.RadixNode(page_id=None, key=None, kv_cache=kv_cache)
+        self.uuid_to_last_node = {}
+        self.kv_cache = kv_cache
+
+    def get_last_node(self, uuid):
+        return self.uuid_to_last_node[uuid]
+
+    def add_node(self, uuid, node):
+        self.uuid_to_last_node[uuid] = node
+        
+    def insert(self, uuid, block_idx, key):
+        node = self.get_last_node(uuid)
+        for child in node.children:
+            if child.page_id in self.kv_cache.resident_blocks and child.key == key:
+                self.kv_cache.locked_slots[child.page_id] = self.kv_cache.locked_slots.get(child.page_id, 0) + 1
+                self.kv_cache._touch_resident_block(child.page_id)
+                self.uuid_to_last_node[uuid] = child
+                self.kv_cache.free_slots.append(block_idx)
+                self.kv_cache.free_slots_cnt += 1
+                del self.kv_cache.locked_slots[block_idx]
+                return child.page_id
+        new_node = self.RadixNode(page_id=block_idx, key=key, kv_cache=self.kv_cache)
+        new_node.parent = node
+        node.children.append(new_node)
+        self.kv_cache.block_to_node[block_idx] = new_node
+        self.kv_cache._register_resident_block(block_idx)
+        self.uuid_to_last_node[uuid] = new_node
+        return block_idx
+
+    def search(self, toks):
+        return self.root.search(toks, [])
+    
+    class RadixNode:
+        def __init__(self, page_id, key, kv_cache):
+            self.key=key
+            self.page_id = page_id
+            self.kv_cache = kv_cache
+            self.parent = None
+            self.children = []
+
+        def search(self, key_lst, nodes_list):
+            if not key_lst:
+                return nodes_list
+            for child in self.children:
+                if child.page_id not in self.kv_cache.resident_blocks:
+                    continue
+                if child.key == key_lst[0]:
+                    self.kv_cache.locked_slots[child.page_id] = self.kv_cache.locked_slots.get(child.page_id, 0) + 1
+                    self.kv_cache._touch_resident_block(child.page_id)
+                    return child.search(key_lst[1:], nodes_list + [child])
+            return nodes_list
+ 
 class RadixKVCache:
     class UUIDState:
         def __init__(self, 
@@ -56,60 +110,7 @@ class RadixKVCache:
             self.write_block_toks.append(int(tok.item()) if torch.is_tensor(tok) else int(tok))
             self.write_block_occupancy+=1
 
-    class RadixNode:
-        def __init__(self, page_id, key, kv_cache):
-            self.key=key
-            self.page_id = page_id
-            self.kv_cache = kv_cache
-            self.parent = None
-            self.children = []
-
-        def search(self, key_lst, nodes_list):
-            if not key_lst:
-                return nodes_list
-            for child in self.children:
-                if child.page_id not in self.kv_cache.resident_blocks:
-                    continue
-                if child.key == key_lst[0]:
-                    self.kv_cache.locked_slots[child.page_id] = self.kv_cache.locked_slots.get(child.page_id, 0) + 1
-                    self.kv_cache._touch_resident_block(child.page_id)
-                    return child.search(key_lst[1:], nodes_list + [child])
-            return nodes_list
-
-    class RadixTree:
-        def __init__(self, kv_cache):
-            self.root = RadixKVCache.RadixNode(page_id=None, key=None, kv_cache=kv_cache)
-            self.uuid_to_last_node = {}
-            self.kv_cache = kv_cache
-
-        def get_last_node(self, uuid):
-            return self.uuid_to_last_node[uuid]
-
-        def add_node(self, uuid, node):
-            self.uuid_to_last_node[uuid] = node
-            
-        def insert(self, uuid, block_idx, key):
-            node = self.get_last_node(uuid)
-            for child in node.children:
-                if child.page_id in self.kv_cache.resident_blocks and child.key == key:
-                    self.kv_cache.locked_slots[child.page_id] = self.kv_cache.locked_slots.get(child.page_id, 0) + 1
-                    self.kv_cache._touch_resident_block(child.page_id)
-                    self.uuid_to_last_node[uuid] = child
-                    self.kv_cache.free_slots.append(block_idx)
-                    self.kv_cache.free_slots_cnt += 1
-                    del self.kv_cache.locked_slots[block_idx]
-                    return child.page_id
-            new_node = RadixKVCache.RadixNode(page_id=block_idx, key=key, kv_cache=self.kv_cache)
-            new_node.parent = node
-            node.children.append(new_node)
-            self.kv_cache.block_to_node[block_idx] = new_node
-            self.kv_cache._register_resident_block(block_idx)
-            self.uuid_to_last_node[uuid] = new_node
-            return block_idx
-
-        def search(self, toks):
-            return self.root.search(toks, [])
-        
+      
     def __init__(self, d_head, head_cnt, num_blocks, block_size, max_requests_per_uuid=None, device=None, dtype=None):
         self.d_head = d_head
         self.head_cnt = head_cnt
@@ -133,7 +134,7 @@ class RadixKVCache:
         self.K = torch.zeros((num_blocks,self.head_cnt, block_size, self.d_head), device=device, dtype=dtype)
         self.V = torch.zeros((num_blocks,self.head_cnt, block_size, self.d_head), device=device, dtype=dtype)
 
-        self.radix_tree = self.RadixTree(self)
+        self.radix_tree = RadixTree(self)
 
     # might return different index if block is already present, then this block will be auto freed, and found block lock_count will be incremented
     def radix_insert(self, uuid, block_idx, toks):
