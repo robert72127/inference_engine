@@ -20,6 +20,19 @@ class OP(Enum):
     PREFILL = 1
     GENERATE = 2
 
+class PrefillChunkSizer:
+    def __init__(self, default_chunk_size: int):
+        self.default_chunk_size = default_chunk_size
+
+    def get_chunk_size(self, batch: list["ServerHandle"], generating_cnt: int):
+        remaining_tokens = [handle.tokens.size(0) - handle.prefill_pos for handle in batch]
+        if generating_cnt == 0:
+            if len(batch) == 1:
+                return remaining_tokens[0]
+            if max(remaining_tokens) - min(remaining_tokens) <= self.default_chunk_size:
+                return max(remaining_tokens)
+        return self.default_chunk_size
+
 class ServerHandle:
     def __init__(
         self,
@@ -166,6 +179,7 @@ class ModelProcessor:
         max_request_len: int,
         max_batch_prefill: int = 8,
         max_batch_generate: int = 8,
+        prefill_chunk_size: int | None = None,
     ):
         self.device = torch.device(device)
         self.model = model_constructor(self.device)
@@ -175,6 +189,9 @@ class ModelProcessor:
 
         self.max_batch_prefill = max_batch_prefill
         self.max_batch_generate = max_batch_generate
+        if prefill_chunk_size is None:
+            prefill_chunk_size = self.kv_caches[0].block_size
+        self.prefill_chunk_sizer = PrefillChunkSizer(prefill_chunk_size)
 
         self.lock = threading.Lock()
         self.cv = threading.Condition(self.lock)
@@ -254,7 +271,10 @@ class ModelProcessor:
 
     def _make_batch(self, batch: list[ServerHandle], op: OP):
         if op == OP.PREFILL:
-            chunk_size = self.kv_caches[0].block_size
+            chunk_size = self.prefill_chunk_sizer.get_chunk_size(
+                batch,
+                len(self.generating),
+            )
             seqs = []
             prefill_last_chunk = []
             handle_ids = []
