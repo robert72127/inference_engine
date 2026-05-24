@@ -10,14 +10,18 @@ class ModelForwardState:
     mask: torch.Tensor | None
     lengths: torch.Tensor | None
     uuid: tuple[int, ...]
+    prefill_offset: torch.Tensor | None = None
+    prefill_first_chunk: torch.Tensor | None = None
     prefill_last_chunk: torch.Tensor | None = None
+    prompt_tokens: torch.Tensor | None = None
+    prompt_lengths: torch.Tensor | None = None
 
 class Model(ABC):
     def __init__(self, device: torch.device):
         pass
 
     @abstractmethod
-    def __call__(self, input: torch.Tensor, state: ModelForwardState):
+    def __call__(self, input: torch.Tensor, state: ModelForwardState) -> torch.Tensor:
         pass
 
     @abstractmethod

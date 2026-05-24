@@ -24,8 +24,7 @@ class KVCacheTests(unittest.TestCase):
         prefill_v = prefill_k + 10.0
         mask = torch.tensor([[True, True, True]])
 
-        init_info = cache.init((11,), prefill_tokens)
-        self.assertEqual(init_info, [([], 0)])
+        cache.init((11,), prefill_tokens)
 
         cache.prefill((11,), prefill_tokens, prefill_k, prefill_v, mask)
         self.assertTrue(torch.equal(cache.get_q_position((11,)), torch.tensor([[3]])))
@@ -37,9 +36,8 @@ class KVCacheTests(unittest.TestCase):
         reuse_k = torch.tensor([[[[109.0, 110.0, 111.0, 112.0]]]])
         reuse_v = reuse_k + 10.0
 
-        init_info = cache.init((22,), reuse_tokens)
-        self.assertEqual(len(init_info[0][0]), 1)
-        self.assertEqual(init_info[0][1], 1)
+        cache.init((22,), reuse_tokens)
+        self.assertEqual(len(cache.uuids[22].commited_blocks), 1)
 
         cache.prefill((22,), reuse_chunk_tokens, reuse_k, reuse_v, torch.tensor([[True]]))
         self.assertTrue(torch.equal(cache.get_q_position((22,)), torch.tensor([[3]])))
@@ -73,8 +71,8 @@ class KVCacheTests(unittest.TestCase):
         cache.release((7,))
 
         shorter_tokens = torch.tensor([[1]])
-        init_info = cache.init((9,), shorter_tokens)
-        self.assertEqual(init_info, [([], 0)])
+        cache.init((9,), shorter_tokens)
+        self.assertEqual(cache.uuids[9].commited_blocks, [])
 
     def test_release_after_init_without_prefill_is_safe(self):
         cache = self.make_cache()

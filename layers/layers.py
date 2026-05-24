@@ -5,6 +5,7 @@ import math
 
 from kvcache import RadixKVCache
 from layers.triton_kernels import paged_mqa_decode
+from models.model import ModelForwardState
 
 class Embedding:
     def __init__(self, weights:torch.Tensor):
@@ -104,97 +105,111 @@ class MultiQueryAttention:
         self.k_bias = None if k_bias is None else k_bias
         self.v_bias = None if v_bias is None else v_bias
 
-    def __call__(self, x:torch.Tensor, tokens, prefill, mask, uuid):
-        if prefill: return self._prefill(x, tokens, mask, uuid)
-        else: return self._generate(x, tokens, uuid)
+    def __call__(self, x:torch.Tensor, state: ModelForwardState):
+        if state.prefill:
+            return self._prefill(x, state)
+        return self._generate(x, state)
 
-    def _prefill(self, x:torch.Tensor, tokens, mask, uuid):
-        Q = self.q_weights(x)
-        Q = Q + self.q_bias if self.q_bias is not None else Q
+    def _prefill(self, x:torch.Tensor, state: ModelForwardState):
+        if state.prefill_first_chunk.any():
+            init_rows = state.prefill_first_chunk.tolist()
+            init_uuid = tuple(req_id for req_id, is_first in zip(state.uuid, init_rows) if is_first)
+            init_tokens = [
+                state.prompt_tokens[idx, : int(state.prompt_lengths[idx].item())]
+                for idx, is_first in enumerate(init_rows)
+                if is_first
+            ]
+            self.KV_cache.init(init_uuid, init_tokens)
 
-        Qh = rearrange(Q, "b l (h d) -> b h l d", h=self.num_attn_heads)
-
-        if self.rope is not None:
-            positions = torch.arange(Qh.size(2), device=Qh.device).unsqueeze(0).expand(Qh.size(0), -1)
-            Qh = self.rope(Qh, position=positions)
-
-        B, H_q, L, D = Qh.shape
-        H_kv = self.num_kv_heads
-        if mask is None:
-            prompt_lens = torch.full((B,), L, device=tokens.device, dtype=torch.long)
-        else:
-            prompt_lens = mask.to(device=tokens.device, dtype=torch.bool).sum(dim=1)
-
-        prompt_tokens = [
-            tokens[idx, : int(prompt_lens[idx].item())]
-            for idx in range(B)
-        ]
-        init_info = self.KV_cache.init(uuid, prompt_tokens)
-
-        Kh = torch.zeros((B, H_kv, L, D), device=x.device, dtype=x.dtype)
-        Vh = torch.zeros_like(Kh)
-        Kh_write = torch.zeros_like(Kh)
-        Vh_write = torch.zeros_like(Vh)
-        for idx in range(B):
-            seq_len = int(prompt_lens[idx].item())
-            if seq_len <= 0:
-                continue
-            cached_blocks, cached_blocks_cnt = init_info[idx]
-            cached_tokens = min(cached_blocks_cnt * self.KV_cache.block_size, seq_len)
-            if cached_tokens > 0:
-                tokens_seen = 0
-                K_pages, V_pages = self.KV_cache.get_pages(cached_blocks)
-                for k_block, v_block in zip(K_pages, V_pages):
-                    valid_tokens = min(self.KV_cache.block_size, cached_tokens - tokens_seen)
-                    if valid_tokens <= 0:
-                        break
-                    Kh[idx, :, tokens_seen:tokens_seen + valid_tokens, :] = k_block[:, :valid_tokens, :]
-                    Vh[idx, :, tokens_seen:tokens_seen + valid_tokens, :] = v_block[:, :valid_tokens, :]
-                    tokens_seen += valid_tokens
-
-            if cached_tokens < seq_len:
-                suffix_x = x[idx : idx + 1, cached_tokens:seq_len, :]
-                K = self.k_weights(suffix_x)
-                V = self.v_weights(suffix_x)
-                K = K + self.k_bias if self.k_bias is not None else K
-                V = V + self.v_bias if self.v_bias is not None else V
-                K_suffix = rearrange(K, "b l (h d) -> b h l d", h=H_kv)
-                V_suffix = rearrange(V, "b l (h d) -> b h l d", h=H_kv)
-                if self.rope is not None:
-                    suffix_positions = torch.arange(cached_tokens, seq_len, device=x.device).unsqueeze(0)
-                    K_suffix = self.rope(K_suffix, position=suffix_positions)
-                Kh[idx, :, cached_tokens:seq_len, :] = K_suffix[0]
-                Vh[idx, :, cached_tokens:seq_len, :] = V_suffix[0]
-                Kh_write[idx, :, cached_tokens:seq_len, :] = K_suffix[0]
-                Vh_write[idx, :, cached_tokens:seq_len, :] = V_suffix[0]
-
-        self.KV_cache.prefill(uuid, tokens, Kh_write, Vh_write, mask)
-
-        group = H_q // H_kv
-        Qg = Qh.view(B, H_kv, group, L, D)
-        Kg = Kh.unsqueeze(2)
-        Vg = Vh.unsqueeze(2)
-
-        attn_scores = torch.matmul(Qg, Kg.transpose(-1, -2)) / math.sqrt(D)
-        causal = torch.triu(
-            torch.ones(L, L, device=attn_scores.device, dtype=torch.bool),
-            diagonal=1,
-        )
-        attn_scores = attn_scores.masked_fill(causal, float("-inf"))
-        if mask is not None:
-            mask = mask.to(device=attn_scores.device, dtype=torch.bool)
-            key_padding = ~mask[:, None, None, None, :]
-            attn_scores = attn_scores.masked_fill(key_padding, float("-inf"))
-        attn = attn_scores.softmax(dim=-1)
-
-        out_g = torch.matmul(attn, Vg)
-        out_heads = rearrange(out_g, "b h_kv g l d -> b l (h_kv g d)")
-        out = self.outproj(out_heads)
-        if mask is not None:
-            out = out * mask[..., None].to(out.dtype)
+        out = torch.zeros_like(x)
+        for idx in range(x.size(0)):
+            out[idx:idx + 1] = self._prefill_row(x[idx:idx + 1], state, idx)
         return out
 
-    def _generate(self, x:torch.Tensor, tokens, uuid):
+    def _prefill_row(self, x_row: torch.Tensor, state: ModelForwardState, idx: int):
+        chunk_len = int(state.lengths[idx].item())
+        if chunk_len == 0:
+            return torch.zeros_like(x_row)
+
+        chunk_start = int(state.prefill_offset[idx].item())
+        chunk_end = chunk_start + chunk_len
+        q = self.q_weights(x_row)
+        q = q + self.q_bias if self.q_bias is not None else q
+        qh = rearrange(q, "b l (h d) -> b h l d", h=self.num_attn_heads)
+        if self.rope is not None:
+            q_positions = torch.arange(chunk_start, chunk_end, device=x_row.device).unsqueeze(0)
+            qh = self.rope(qh, position=q_positions)
+
+        kh, vh = self._materialize_prefill_kv_row(x_row, state, idx, chunk_start, chunk_end)
+        group = self.num_attn_heads // self.num_kv_heads
+        qg = qh[0, :, :chunk_len, :].view(self.num_kv_heads, group, chunk_len, self.head_dim)
+        kg = kh.unsqueeze(1)
+        vg = vh.unsqueeze(1)
+        attn_scores = torch.matmul(qg, kg.transpose(-1, -2)) / math.sqrt(self.head_dim)
+        query_positions = torch.arange(chunk_start, chunk_end, device=attn_scores.device)
+        key_positions = torch.arange(chunk_end, device=attn_scores.device)
+        causal = key_positions.unsqueeze(0) > query_positions.unsqueeze(1)
+        attn_scores = attn_scores.masked_fill(causal[None, None, :, :], float("-inf"))
+        attn = attn_scores.softmax(dim=-1)
+        out_g = torch.matmul(attn, vg)
+        out_heads = rearrange(out_g, "h_kv g l d -> l (h_kv g d)")
+        row_out = torch.zeros_like(x_row)
+        row_out[0, :chunk_len, :] = self.outproj(out_heads.unsqueeze(0))[0]
+        return row_out
+
+    def _materialize_prefill_kv_row(self, x_row: torch.Tensor, state: ModelForwardState, idx: int, chunk_start: int, chunk_end: int):
+        chunk_len = chunk_end - chunk_start
+        pages_info, cached_chunk_tokens = self.KV_cache.get_prefill_chunk_info(
+            state.uuid[idx],
+            chunk_start,
+            chunk_len,
+        )
+        cached_tokens = chunk_start + cached_chunk_tokens
+
+        kh = torch.zeros((self.num_kv_heads, chunk_end, self.head_dim), device=x_row.device, dtype=x_row.dtype)
+        vh = torch.zeros_like(kh)
+        if cached_tokens > 0:
+            self._load_cached_prefix(kh, vh, pages_info["indexes"], cached_tokens)
+
+        local_start = cached_chunk_tokens
+        if local_start < chunk_len:
+            suffix_x = x_row[:, local_start:chunk_len, :]
+            k = self.k_weights(suffix_x)
+            v = self.v_weights(suffix_x)
+            k = k + self.k_bias if self.k_bias is not None else k
+            v = v + self.v_bias if self.v_bias is not None else v
+            k_suffix = rearrange(k, "b l (h d) -> b h l d", h=self.num_kv_heads)
+            v_suffix = rearrange(v, "b l (h d) -> b h l d", h=self.num_kv_heads)
+            if self.rope is not None:
+                suffix_positions = torch.arange(chunk_start + local_start, chunk_end, device=x_row.device).unsqueeze(0)
+                k_suffix = self.rope(k_suffix, position=suffix_positions)
+            kh[:, chunk_start + local_start:chunk_end, :] = k_suffix[0]
+            vh[:, chunk_start + local_start:chunk_end, :] = v_suffix[0]
+            write_len = chunk_len - local_start
+            self.KV_cache.prefill(
+                (state.uuid[idx],),
+                state.tokens[idx:idx + 1, local_start:chunk_len],
+                k_suffix,
+                v_suffix,
+                torch.ones((1, write_len), device=state.tokens.device, dtype=torch.bool),
+            )
+        return kh, vh
+
+    def _load_cached_prefix(self, kh: torch.Tensor, vh: torch.Tensor, indexes, cached_tokens: int):
+        tokens_seen = 0
+        K_pages, V_pages = self.KV_cache.get_pages(indexes)
+        for k_block, v_block in zip(K_pages, V_pages):
+            valid_tokens = min(self.KV_cache.block_size, cached_tokens - tokens_seen)
+            if valid_tokens <= 0:
+                break
+            kh[:, tokens_seen:tokens_seen + valid_tokens, :] = k_block[:, :valid_tokens, :]
+            vh[:, tokens_seen:tokens_seen + valid_tokens, :] = v_block[:, :valid_tokens, :]
+            tokens_seen += valid_tokens
+
+    def _generate(self, x:torch.Tensor, state: ModelForwardState):
+        tokens = state.tokens
+        uuid = state.uuid
+        
         Q = self.q_weights(x)
         K = self.k_weights(x)
         V = self.v_weights(x)
@@ -285,8 +300,8 @@ class TransformerBlock:
         self.attention = attention
         self.post_norm = post_norm
 
-    def __call__(self, x:torch.Tensor, tokens, prefill, mask, uuid):
+    def __call__(self, x:torch.Tensor, state: ModelForwardState):
         attn_in = self.pre_norm(x)
-        x = x + self.attention(attn_in, tokens, prefill, mask, uuid)
+        x = x + self.attention(attn_in, state)
         mlp_in = self.post_norm(x)
         return  x + self.mlp(mlp_in)

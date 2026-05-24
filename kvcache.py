@@ -126,8 +126,11 @@ class RadixKVCache:
 
         def get_pages_info(self):
             seq_len = self.block_size * len(self.commited_blocks) + self.write_block_occupancy
+            indexes = list(self.commited_blocks)
+            if self.write_block is not None:
+                indexes.append(self.write_block)
             return {
-                "indexes": self.commited_blocks + [self.write_block],
+                "indexes": indexes,
                 "token_count":seq_len
             }
 
@@ -243,6 +246,14 @@ class RadixKVCache:
         V_ = [self.V[ind] for ind in indexes]
         return K_, V_
 
+    def get_pages_info(self, uuids):
+        return [self.uuids[uuid].get_pages_info() for uuid in uuids]
+
+    def get_prefill_chunk_info(self, uuid, chunk_start, chunk_len):
+        pages_info = self.uuids[uuid].get_pages_info()
+        cached_chunk_tokens = max(0, min(pages_info["token_count"], chunk_start + chunk_len) - chunk_start)
+        return pages_info, cached_chunk_tokens
+
     def get_blocks_available(self):
         reserved = 0
         for uuid_state in self.uuids.values():
@@ -266,7 +277,6 @@ class RadixKVCache:
 
     # first step in prefill, serach for pages matching longest prefix of toks
     def init(self, uuids, toks):
-        out = []
         for i, uuid in enumerate(uuids):
             blocks, blocks_cnt = self.radix_search(uuid, self._block_keys_for_tokens(toks[i]))
             self.uuids[uuid] = self.UUIDState(
@@ -276,8 +286,6 @@ class RadixKVCache:
                 blocks_count=blocks_cnt,
                 commited_blocks=blocks,
             )
-            out.append((blocks, blocks_cnt))
-        return out
 
     def prefill(self, uuids, toks, K, V, mask):
         for i, uuid in enumerate(uuids):

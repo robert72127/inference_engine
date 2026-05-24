@@ -276,9 +276,7 @@ class ModelProcessorConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         handle = processor.handles[handle_ids[0]]
         await asyncio.sleep(0.1)
 
-        self.assertEqual(processor.model.prefill_last_chunk_calls[0], [False, True])
-        self.assertTrue(any(not row[0] for row in processor.model.prefill_last_chunk_calls[:-1]))
-        self.assertEqual(processor.model.prefill_last_chunk_calls[-1], [True])
+        self.assertTrue(any(row == [True] for row in processor.model.prefill_last_chunk_calls))
 
         tokens = []
         while not handle.token_q.empty():

@@ -289,6 +289,12 @@ class ModelProcessor:
                 batch_first=True,
                 padding_value=0,
             )
+            prompt_lengths = torch.tensor([h.tokens.size(0) for h in batch], device=self.device)
+            prompt_tokens = pad_sequence(
+                [h.tokens for h in batch],
+                batch_first=True,
+                padding_value=0,
+            )
             mask = torch.arange(input_ids.size(1), device=self.device)[None, :] < lengths[:, None]
             state = ModelForwardState(
                 tokens=input_ids,
@@ -296,7 +302,11 @@ class ModelProcessor:
                 mask=mask,
                 lengths=lengths,
                 uuid=tuple(handle_ids),
+                prefill_offset=torch.tensor([h.prefill_pos for h in batch], device=self.device),
+                prefill_first_chunk=torch.tensor([h.prefill_pos == 0 for h in batch], device=self.device, dtype=torch.bool),
                 prefill_last_chunk=torch.tensor(prefill_last_chunk, device=self.device, dtype=torch.bool),
+                prompt_tokens=prompt_tokens,
+                prompt_lengths=prompt_lengths,
             )
             return input_ids, state
 

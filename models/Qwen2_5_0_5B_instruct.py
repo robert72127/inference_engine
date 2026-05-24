@@ -263,17 +263,13 @@ class Qwen2_5_0_5B_Instruct(Model):
         )
   
     @torch.inference_mode()
-    def __call__(self, input: torch.Tensor, state: ModelForwardState):
+    def __call__(self, input: torch.Tensor, state: ModelForwardState) -> torch.Tensor:
         tokens = state.tokens.to(self.device)
         mask = None if state.mask is None else state.mask.to(self.device)
         out = input.to(self.device)
         for layer in self.layers: 
             layer, is_transformer = layer
-            out = (
-                layer(out, tokens=tokens, prefill=state.prefill, mask=mask, uuid=state.uuid)
-                if is_transformer
-                else layer(out)
-            )
+            out = layer(out, state) if is_transformer else layer(out)
         if state.lengths is not None:
             out = out[torch.arange(out.size(0)), state.lengths - 1]
         else:
@@ -283,6 +279,9 @@ class Qwen2_5_0_5B_Instruct(Model):
         for layer in self.output_layers:
             out = layer(out)
         return out
+
+    def get_model_dir(self):
+        return self.model_dir
 
 if __name__ == '__main__':
     pages = os.sysconf("SC_PHYS_PAGES")
