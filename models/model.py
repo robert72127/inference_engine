@@ -3,11 +3,21 @@ from dataclasses import dataclass
 
 import torch
 
+@dataclass(frozen=True)
+class ModelForwardState:
+    tokens: torch.Tensor
+    prefill: bool
+    mask: torch.Tensor | None
+    lengths: torch.Tensor | None
+    uuid: tuple[int, ...]
+    prefill_last_chunk: bool = True
+
 class Model(ABC):
     def __init__(self, device: torch.device):
         pass
+
     @abstractmethod
-    def __call__(self, input, tokens, prefill, mask, lengths, uuid, prefill_last_chunk):
+    def __call__(self, input: torch.Tensor, state: ModelForwardState):
         pass
 
     @abstractmethod

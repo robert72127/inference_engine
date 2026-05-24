@@ -4,6 +4,7 @@ import unittest
 import torch
 
 from model_processor import ModelProcessor, ServerHandle
+from models.model import ModelForwardState
 
 
 class FakeConcurrentModel:
@@ -36,14 +37,14 @@ class FakeConcurrentModel:
         self.generate_calls = 0
         self.kv_caches = [self.FakeCache()]
 
-    def __call__(self, input_ids, tokens, prefill, mask, lengths, uuid, prefill_is_last_chunk=True):
+    def __call__(self, input_ids, state: ModelForwardState):
         batch = input_ids.shape[0]
         logits = torch.full(
             (batch, self.vocab_size),
             -1000.0,
             device=self.device,
         )
-        if prefill:
+        if state.prefill:
             logits[:, 1] = 0.0
         else:
             self.generate_calls += 1
@@ -179,11 +180,11 @@ class ModelProcessorConcurrencyTests(unittest.IsolatedAsyncioTestCase):
                 self.kv_caches = [self.FakeCache(total_blocks=3, block_size=2)]
                 self.prefill_batch_sizes = []
 
-            def __call__(self, input_ids, tokens, prefill, mask, lengths, uuid, prefill_is_last_chunk=True):
-                if prefill:
+            def __call__(self, input_ids, state: ModelForwardState):
+                if state.prefill:
                     self.prefill_batch_sizes.append(input_ids.size(0))
-                logits = super().__call__(input_ids, tokens, prefill, mask, lengths, uuid, prefill_is_last_chunk)
-                if not prefill:
+                logits = super().__call__(input_ids, state)
+                if not state.prefill:
                     logits[:, :] = -1000.0
                     logits[:, 7] = 0.0
                 return logits

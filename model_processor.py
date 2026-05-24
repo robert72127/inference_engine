@@ -12,6 +12,7 @@ import zmq
 import zmq.asyncio
 from torch.nn.utils.rnn import pad_sequence
 
+from models.model import ModelForwardState
 from sampling import top_k_top_p_sample
 from kvcache import blocks_for_tokens
 
@@ -261,7 +262,15 @@ class ModelProcessor:
                 padding_value=0,
             )
             mask = torch.arange(input_ids.size(1), device=self.device)[None, :] < lengths[:, None]
-            return handle_ids, input_ids, mask, lengths
+            state = ModelForwardState(
+                tokens=input_ids,
+                prefill=True,
+                mask=mask,
+                lengths=lengths,
+                uuid=tuple(handle_ids),
+                prefill_last_chunk=True,
+            )
+            return input_ids, state
 
         else:
             input_ids = torch.tensor(
@@ -269,7 +278,14 @@ class ModelProcessor:
                 device=self.device,
                 dtype=torch.long,
             ).unsqueeze(1)
-            return handle_ids, input_ids, None, None
+            state = ModelForwardState(
+                tokens=input_ids,
+                prefill=False,
+                mask=None,
+                lengths=None,
+                uuid=tuple(handle_ids),
+            )
+            return input_ids, state
 
     def worker_loop(self):
         next_op = OP.PREFILL
@@ -305,17 +321,8 @@ class ModelProcessor:
                 self.in_flight.update(handle.id for handle in batch)
 
             with torch.inference_mode():
-                handle_ids, input_ids, mask, lengths = self._make_batch(batch, op)
-                request_key = tuple(handle_ids)
-                logits = self.model(
-                    input_ids,
-                    input_ids,
-                    op == OP.PREFILL,
-                    mask,
-                    lengths,
-                    request_key,
-                    prefill_last_chunk=True,
-                )
+                input_ids, state = self._make_batch(batch, op)
+                logits = self.model(input_ids, state)
                 results = self._decode_batch(logits, batch)
                 results = results.tolist()
 

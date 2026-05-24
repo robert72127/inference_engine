@@ -5,7 +5,7 @@ import json
 import os
 from pathlib import Path
 
-from models.model import Model
+from models.model import Model, ModelForwardState
 from kvcache import blocks_for_tokens
 from layers.layers import (
     Embedding,
@@ -263,22 +263,22 @@ class Qwen2_5_0_5B_Instruct(Model):
         )
   
     @torch.inference_mode()
-    def __call__(self, input, tokens, prefill, mask, lengths, uuid, prefill_last_chunk=True):
-        tokens = tokens.to(self.device)
-        mask = None if mask is None else mask.to(self.device)
+    def __call__(self, input: torch.Tensor, state: ModelForwardState):
+        tokens = state.tokens.to(self.device)
+        mask = None if state.mask is None else state.mask.to(self.device)
         out = input.to(self.device)
         for layer in self.layers: 
             layer, is_transformer = layer
             out = (
-                layer(out, tokens=tokens, prefill=prefill, mask=mask, uuid=uuid)
+                layer(out, tokens=tokens, prefill=state.prefill, mask=mask, uuid=state.uuid)
                 if is_transformer
                 else layer(out)
             )
-        if lengths is not None:
-            out = out[torch.arange(out.size(0)), lengths - 1]
+        if state.lengths is not None:
+            out = out[torch.arange(out.size(0)), state.lengths - 1]
         else:
             out = out[:, -1, :]
-        if prefill and not prefill_last_chunk:
+        if state.prefill and not state.prefill_last_chunk:
             return out
         for layer in self.output_layers:
             out = layer(out)
