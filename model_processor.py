@@ -208,11 +208,8 @@ class ModelProcessor:
                 f"Prompt length {prompt_len} exceeds KV cache capacity {self.max_request_len}"
             )
         allowed_new_tokens = self.max_request_len - prompt_len
-        if max_new_tokens is None:
-            max_new_tokens = allowed_new_tokens
-        else:
-            max_new_tokens = min(max_new_tokens, allowed_new_tokens)
-
+        max_new_tokens = allowed_new_tokens if max_new_tokens is None else min(max_new_tokens, allowed_new_tokens)
+       
         with self.cv:
             handle_id = self.next_handle_id
             self.next_handle_id += 1
@@ -273,7 +270,7 @@ class ModelProcessor:
                 dtype=torch.long,
             ).unsqueeze(1)
             return handle_ids, input_ids, None, None
-    
+
     def worker_loop(self):
         next_op = OP.PREFILL
 
@@ -300,31 +297,6 @@ class ModelProcessor:
                     op = OP.GENERATE
                     batch = self.generating[:max_batch_size]
 
-            if op == OP.GENERATE:
-                full = [
-                    handle
-                    for handle in batch
-                    if handle.cache_len >= self.max_request_len
-                    or handle.generated_tokens >= handle.max_new_tokens
-                ]
-                if full:
-                    with self.cv:
-                        for handle in full:
-                            handle.finished = True
-                            self.generating = [h for h in self.generating if h.id != handle.id]
-                            self.handles.pop(handle.id, None)
-                            self._release_caches(handle.id)
-                            handle.token_q.put_nowait(self.eos_token_id)
-                    batch = [
-                        handle
-                        for handle in batch
-                        if handle.cache_len < self.max_request_len
-                        and handle.generated_tokens < handle.max_new_tokens
-                    ]
-                    if not batch:
-                        next_op = OP.PREFILL
-                        continue
-
             with self.cv:
                 batch = [handle for handle in batch if handle.id in self.handles]
                 if not batch:
@@ -347,7 +319,11 @@ class ModelProcessor:
                         handle.cache_len += 1
                         handle.generated_tokens += 1
                     handle.input_token = tok
-                    if tok == self.eos_token_id or released:
+                    reached_limit = (
+                        handle.cache_len >= self.max_request_len
+                        or handle.generated_tokens >= handle.max_new_tokens
+                    )
+                    if tok == self.eos_token_id or released or reached_limit:
                         handle.finished = True
                         self.generating = [
                             h for h in self.generating
