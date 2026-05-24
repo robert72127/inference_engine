@@ -140,10 +140,9 @@ class RadixKVCache:
 
         def insert_single(self, tok, K,V):
             if self.write_block_occupancy == self.kv_cache.block_size:
-               self.write_block = self.kv_cache.radix_insert(self.uuid, self.write_block, self.write_block_toks)
-               self.commited_blocks += [self.write_block]
+               self.commit_write_block()
                self.write_block = self.kv_cache.allocate_blocks()[0]
-               self.write_block_occupancy = 0 
+               self.write_block_occupancy = 0
                self.blocks_count +=1
                self.write_block_toks = []
 
@@ -151,6 +150,23 @@ class RadixKVCache:
             self.kv_cache.V[self.write_block][:, self.write_block_occupancy, :] = V 
             self.write_block_toks.append(int(tok.item()) if torch.is_tensor(tok) else int(tok))
             self.write_block_occupancy+=1
+
+        def commit_write_block(self):
+            self.write_block = self.kv_cache.radix_insert(self.uuid, self.write_block, self.write_block_toks)
+            self.commited_blocks.append(self.write_block)
+            self.write_block = None
+            self.write_block_occupancy = 0
+            self.write_block_toks = []
+
+        def append_chunk_tokens(self, toks, K, V, src_idx, token_count):
+            for _ in range(token_count):
+                in_block_idx = self.write_block_occupancy
+                self.kv_cache.K[self.write_block][:, in_block_idx, :] = K[:, src_idx, :]
+                self.kv_cache.V[self.write_block][:, in_block_idx, :] = V[:, src_idx, :]
+                self.write_block_toks.append(int(toks[src_idx].item()))
+                self.write_block_occupancy += 1
+                src_idx += 1
+            return src_idx
 
     def __init__(self, d_head, head_cnt, num_blocks, block_size, max_requests_per_uuid=None, device=None, dtype=None):
         self.d_head = d_head
@@ -266,47 +282,30 @@ class RadixKVCache:
     def prefill(self, uuids, toks, K, V, mask):
         for i, uuid in enumerate(uuids):
             uuid_state = self.uuids[uuid]
-            seq_len = int(mask[i].sum().item())
-            cached_tokens = len(uuid_state.commited_blocks) * self.block_size
-            if cached_tokens > seq_len:
-                raise ValueError("Cached prefix is longer than provided sequence")
+            src_idx = 0
+            remaining_tokens = int(mask[i].sum().item())
 
-            remaining_tokens = seq_len - cached_tokens
-            blocks_cnt = blocks_for_tokens(remaining_tokens, self.block_size)
-            if blocks_cnt == 0:
-                blocks_cnt = 1
+            if uuid_state.write_block is not None:
+                fill_tokens = min(remaining_tokens, self.block_size - uuid_state.write_block_occupancy)
+                src_idx = uuid_state.append_chunk_tokens(toks[i], K[i], V[i], src_idx, fill_tokens)
+                remaining_tokens -= fill_tokens
 
-            indexes = self.allocate_blocks(blocks_cnt)
-            pages_K, pages_V = self.get_pages(indexes)
+                if uuid_state.write_block_occupancy == self.block_size:
+                    uuid_state.commit_write_block()
 
-            for j in range(remaining_tokens):
-                src_idx = cached_tokens + j
-                block_idx = j // self.block_size
-                in_block_idx = j % self.block_size
-                pages_K[block_idx][:, in_block_idx, :] = K[i, :, src_idx, :]
-                pages_V[block_idx][:, in_block_idx, :] = V[i, :, src_idx, :]
+            while remaining_tokens > 0:
+                if uuid_state.write_block is None:
+                    uuid_state.write_block = self.allocate_blocks()[0]
+                    uuid_state.write_block_occupancy = 0
+                    uuid_state.write_block_toks = []
+                    uuid_state.blocks_count += 1
 
-            commited_blocks = indexes[:-1]
-            for b, block_idx in enumerate(commited_blocks):
-                start = cached_tokens + b * self.block_size
-                end = start + self.block_size
-                block_toks = toks[i, start:end].tolist()
-                commited_blocks[b] = self.radix_insert(uuid, block_idx, block_toks)
+                fill_tokens = min(remaining_tokens, self.block_size)
+                src_idx = uuid_state.append_chunk_tokens(toks[i], K[i], V[i], src_idx, fill_tokens)
+                remaining_tokens -= fill_tokens
 
-            write_block_occupancy = remaining_tokens % self.block_size
-            if remaining_tokens > 0 and write_block_occupancy == 0:
-                write_block_occupancy = 0
-                write_block_toks = []
-            else:
-                write_start = seq_len - write_block_occupancy
-                write_block_toks = toks[i, write_start:seq_len].tolist()
-
-            uuid_state.insert_prefill(
-                commited_blocks=commited_blocks, 
-                write_block=indexes[-1], 
-                write_block_occupancy=write_block_occupancy,
-                write_block_toks=write_block_toks,
-            )
+                if uuid_state.write_block_occupancy == self.block_size:
+                    uuid_state.commit_write_block()
 
     def append_and_fetch(self, uuids, K, V, toks):
         max_len = 0
