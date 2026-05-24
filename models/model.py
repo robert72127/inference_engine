@@ -10,7 +10,7 @@ class ModelForwardState:
     mask: torch.Tensor | None
     lengths: torch.Tensor | None
     uuid: tuple[int, ...]
-    prefill_last_chunk: bool = True
+    prefill_last_chunk: torch.Tensor | None = None
 
 class Model(ABC):
     def __init__(self, device: torch.device):

@@ -35,6 +35,7 @@ class FakeConcurrentModel:
         self.device = torch.device(device)
         self.vocab_size = 8
         self.generate_calls = 0
+        self.prefill_last_chunk_calls = []
         self.kv_caches = [self.FakeCache()]
 
     def __call__(self, input_ids, state: ModelForwardState):
@@ -45,6 +46,7 @@ class FakeConcurrentModel:
             device=self.device,
         )
         if state.prefill:
+            self.prefill_last_chunk_calls.append(state.prefill_last_chunk.tolist())
             logits[:, 1] = 0.0
         else:
             self.generate_calls += 1
@@ -203,3 +205,26 @@ class ModelProcessorConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0.1)
 
         self.assertEqual(processor.model.prefill_batch_sizes, [1, 1])
+
+    async def test_prefill_requeues_until_last_chunk(self):
+        processor = ModelProcessor(
+            FakeConcurrentModel,
+            torch.device("cpu"),
+            eos_token_id=7,
+            max_request_len=8,
+            max_batch_prefill=8,
+            max_batch_generate=8,
+        )
+
+        handle_id = await processor.prefill([11, 12, 13], temperature=0.0, top_p=1.0)
+        handle = processor.handles[handle_id]
+        await asyncio.sleep(0.1)
+
+        self.assertEqual(processor.model.prefill_last_chunk_calls, [[False], [False], [True]])
+
+        tokens = []
+        while not handle.token_q.empty():
+            tokens.append(handle.token_q.get_nowait())
+
+        self.assertGreaterEqual(len(tokens), 1)
+        self.assertEqual(tokens[0], 1)

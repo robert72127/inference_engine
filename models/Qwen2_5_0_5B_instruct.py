@@ -278,8 +278,8 @@ class Qwen2_5_0_5B_Instruct(Model):
             out = out[torch.arange(out.size(0)), state.lengths - 1]
         else:
             out = out[:, -1, :]
-        if state.prefill and not state.prefill_last_chunk:
-            return out
+        if state.prefill:
+            out = out[state.prefill_last_chunk]
         for layer in self.output_layers:
             out = layer(out)
         return out

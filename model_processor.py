@@ -34,6 +34,7 @@ class ServerHandle:
         self.temperature = temperature
         self.top_p = top_p
         self.cache_len = int(tokens.size(0))
+        self.prefill_pos = 0
         self.max_new_tokens = max_new_tokens
         self.generated_tokens = 0
 
@@ -252,9 +253,16 @@ class ModelProcessor:
             self.cv.notify()
 
     def _make_batch(self, batch: list[ServerHandle], op: OP):
-        handle_ids = [h.id for h in batch]
         if op == OP.PREFILL:
-            seqs = [h.tokens for h in batch]
+            chunk_size = self.kv_caches[0].block_size
+            seqs = []
+            prefill_last_chunk = []
+            handle_ids = []
+            for handle in batch:
+                end = min(handle.prefill_pos + chunk_size, handle.tokens.size(0))
+                seqs.append(handle.tokens[handle.prefill_pos:end])
+                prefill_last_chunk.append(end == handle.tokens.size(0))
+                handle_ids.append(handle.id)
             lengths = torch.tensor([t.size(0) for t in seqs], device=self.device)
             input_ids = pad_sequence(
                 seqs,
@@ -268,11 +276,12 @@ class ModelProcessor:
                 mask=mask,
                 lengths=lengths,
                 uuid=tuple(handle_ids),
-                prefill_last_chunk=True,
+                prefill_last_chunk=torch.tensor(prefill_last_chunk, device=self.device, dtype=torch.bool),
             )
             return input_ids, state
 
         else:
+            handle_ids = [h.id for h in batch]
             input_ids = torch.tensor(
                 [h.input_token for h in batch],
                 device=self.device,
@@ -322,15 +331,33 @@ class ModelProcessor:
 
             with torch.inference_mode():
                 input_ids, state = self._make_batch(batch, op)
-                logits = self.model(input_ids, state)
-                results = self._decode_batch(logits, batch)
-                results = results.tolist()
+                model_out = self.model(input_ids, state)
+                if op == OP.PREFILL:
+                    final_rows = state.prefill_last_chunk
+                    result_batch = [handle for handle, is_final in zip(batch, final_rows.tolist()) if is_final]
+                    results = []
+                    if final_rows.any():
+                        results = self._decode_batch(model_out, result_batch).tolist()
+                else:
+                    result_batch = batch
+                    results = self._decode_batch(model_out, result_batch).tolist()
 
             with self.cv:
-                for handle, tok in zip(batch, results):
+                result_idx = 0
+                for batch_idx, handle in enumerate(batch):
                     self.in_flight.discard(handle.id)
                     released = handle.cancelled or handle.id not in self.handles
-                    if op == OP.GENERATE:
+                    if op == OP.PREFILL:
+                        handle.prefill_pos += int(state.lengths[batch_idx].item())
+                        is_final_chunk = bool(state.prefill_last_chunk[batch_idx].item())
+                        if not is_final_chunk:
+                            if not released:
+                                self.prefill_waiting.append(handle)
+                            continue
+                        tok = results[result_idx]
+                        result_idx += 1
+                    else:
+                        tok = results[batch_idx]
                         handle.cache_len += 1
                         handle.generated_tokens += 1
                     handle.input_token = tok
