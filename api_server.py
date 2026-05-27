@@ -9,7 +9,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from engine import BACKEND, Engine, GenDelta
+from engine import BACKEND, Engine, GenDelta, GenStart, GenEnd
 from models import MODEL
 from utils.logger import Logger
 
@@ -59,6 +59,14 @@ def chunk_payload(completion_id: str, created: int, model: str, delta: dict, fin
         "created": created,
         "model": model,
         "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
+    }
+
+
+def get_usage(prompt_tokens: int, completion_tokens: int) -> dict[str, int]:
+    return {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": prompt_tokens + completion_tokens,
     }
 
 
@@ -118,11 +126,22 @@ async def chat(req: ChatCompletionRequest):
     if req.stream:
         async def event_stream():
             yield f"data: {json.dumps(chunk_payload(completion_id, created, req.model, {'role': 'assistant'}))}\n\n"
+
+            prompt_tokens = 0
+            completion_tokens = 0
+
             async for ev in engine.generate_stream(prompt, req.max_tokens, temperature=req.temperature, top_p=req.top_p):
-                if isinstance(ev, GenDelta):
-                    yield f"data: {json.dumps(chunk_payload(completion_id, created, req.model, {'content': ev.text}))}\n\n"
-            yield f"data: {json.dumps(chunk_payload(completion_id, created, req.model, {}, 'stop'))}\n\n"
+                match ev:
+                    case GenStart():
+                        prompt_tokens = ev.prompt_tokens
+                    case GenEnd():
+                        completion_tokens = ev.completion_tokens 
+                    case GenDelta():
+                        yield f"data: {json.dumps(chunk_payload(completion_id, created, req.model, {'content': ev.text}))}\n\n"
+            
+            yield f"data: {json.dumps(chunk_payload(completion_id, created, req.model, {}, 'stop') | {"usage": get_usage(prompt_tokens, completion_tokens)})}\n\n"
             yield "data: [DONE]\n\n"
+            
             Logger.info("Chat completion streamed id=%s", completion_id)
 
         return StreamingResponse(event_stream(), media_type="text/event-stream")
@@ -141,9 +160,5 @@ async def chat(req: ChatCompletionRequest):
                 "finish_reason": "stop",
             }
         ],
-        "usage": {
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": completion_tokens,
-            "total_tokens": prompt_tokens + completion_tokens,
-        },
+        "usage": get_usage(prompt_tokens, completion_tokens),
     }
