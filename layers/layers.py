@@ -150,27 +150,36 @@ class MultiQueryAttention:
             chunk_end = chunk_start + chunk_len
             row = x[bidx:bidx + 1, :chunk_len, :]
 
-            q = self.q_weights(row)
-            q = q + self.q_bias if self.q_bias is not None else q
-            qh = rearrange(q, "b l (h d) -> b h l d", h=self.num_attn_heads)
-            if self.rope is not None:
-                q_positions = torch.arange(chunk_start, chunk_end, device=row.device).unsqueeze(0)
-                qh = self.rope(qh, position=q_positions)
-
             pages_info, cached_chunk_tokens = self.KV_cache.get_prefill_chunk_info(
                 state.uuid[bidx],
                 chunk_start,
                 chunk_len,
             )
+            if cached_chunk_tokens == chunk_len:
+                if not prefill.last_chunk:
+                    continue
+                query_start = chunk_len - 1
+            else:
+                query_start = cached_chunk_tokens
+
+            query_x = row[:, query_start:chunk_len, :]
+            query_len = chunk_len - query_start
+            query_offset = chunk_start + query_start
+            q = self.q_weights(query_x)
+            q = q + self.q_bias if self.q_bias is not None else q
+            qh = rearrange(q, "b l (h d) -> b h l d", h=self.num_attn_heads)
+            if self.rope is not None:
+                q_positions = torch.arange(query_offset, chunk_end, device=row.device).unsqueeze(0)
+                qh = self.rope(qh, position=q_positions)
+
             cached_tokens = chunk_start + cached_chunk_tokens
             kh = torch.zeros((self.num_kv_heads, chunk_end, self.head_dim), device=row.device, dtype=row.dtype)
             vh = torch.zeros_like(kh)
             if cached_tokens > 0:
                 self._load_cached_prefix(kh, vh, pages_info["indexes"], cached_tokens)
 
-            local_start = cached_chunk_tokens
-            if local_start < chunk_len:
-                suffix_x = row[:, local_start:chunk_len, :]
+            if cached_chunk_tokens < chunk_len:
+                suffix_x = row[:, cached_chunk_tokens:chunk_len, :]
                 k = self.k_weights(suffix_x)
                 v = self.v_weights(suffix_x)
                 k = k + self.k_bias if self.k_bias is not None else k
@@ -178,32 +187,32 @@ class MultiQueryAttention:
                 k_suffix = rearrange(k, "b l (h d) -> b h l d", h=self.num_kv_heads)
                 v_suffix = rearrange(v, "b l (h d) -> b h l d", h=self.num_kv_heads)
                 if self.rope is not None:
-                    suffix_positions = torch.arange(chunk_start + local_start, chunk_end, device=row.device).unsqueeze(0)
+                    suffix_positions = torch.arange(chunk_start + cached_chunk_tokens, chunk_end, device=row.device).unsqueeze(0)
                     k_suffix = self.rope(k_suffix, position=suffix_positions)
-                kh[:, chunk_start + local_start:chunk_end, :] = k_suffix[0]
-                vh[:, chunk_start + local_start:chunk_end, :] = v_suffix[0]
-                write_len = chunk_len - local_start
+                kh[:, chunk_start + cached_chunk_tokens:chunk_end, :] = k_suffix[0]
+                vh[:, chunk_start + cached_chunk_tokens:chunk_end, :] = v_suffix[0]
+                write_len = chunk_len - cached_chunk_tokens
                 self.KV_cache.prefill(
                     (state.uuid[bidx],),
-                    state.tokens[bidx:bidx + 1, local_start:chunk_len],
+                    state.tokens[bidx:bidx + 1, cached_chunk_tokens:chunk_len],
                     k_suffix,
                     v_suffix,
                     torch.ones((1, write_len), device=state.tokens.device, dtype=torch.bool),
                 )
 
             group = self.num_attn_heads // self.num_kv_heads
-            qg = qh[0].view(self.num_kv_heads, group, chunk_len, self.head_dim)
+            qg = qh[0].view(self.num_kv_heads, group, query_len, self.head_dim)
             kg = kh.unsqueeze(1)
             vg = vh.unsqueeze(1)
             attn_scores = torch.matmul(qg, kg.transpose(-1, -2)) / math.sqrt(self.head_dim)
-            query_positions = torch.arange(chunk_start, chunk_end, device=attn_scores.device)
+            query_positions = torch.arange(query_offset, chunk_end, device=attn_scores.device)
             key_positions = torch.arange(chunk_end, device=attn_scores.device)
             causal = key_positions.unsqueeze(0) > query_positions.unsqueeze(1)
             attn_scores = attn_scores.masked_fill(causal[None, None, :, :], float("-inf"))
             attn = attn_scores.softmax(dim=-1)
             out_g = torch.matmul(attn, vg)
             out_heads = rearrange(out_g, "h_kv g l d -> l (h_kv g d)")
-            out[bidx:bidx + 1, :chunk_len, :] = self.outproj(out_heads.unsqueeze(0))
+            out[bidx:bidx + 1, query_start:chunk_len, :] = self.outproj(out_heads.unsqueeze(0))
         
         return out
 
