@@ -276,12 +276,17 @@ class Qwen2_5_0_5B_Instruct(Model):
         for layer in self.layers: 
             layer, is_transformer = layer
             out = layer(out, state) if is_transformer else layer(out)
-        if state.lengths is not None:
-            out = out[torch.arange(out.size(0)), state.lengths - 1]
+        if state.prefill_state is not None:
+            out = torch.stack(
+                [
+                    out[idx, int(prefill.length.item()) - 1]
+                    for idx, prefill in enumerate(state.prefill_state)
+                ]
+            )
         else:
             out = out[:, -1, :]
         if state.prefill:
-            out = out[state.prefill_last_chunk]
+            out = out[[prefill.last_chunk for prefill in state.prefill_state]]
         for layer in self.output_layers:
             out = layer(out)
         return out

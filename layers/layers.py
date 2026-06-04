@@ -125,12 +125,13 @@ class MultiQueryAttention:
             return self._prefill(x, state)
         return self._generate(x, state)
 
+
     def _prefill(self, x:torch.Tensor, state: ModelForwardState):
-        if state.prefill_first_chunk.any():
-            init_rows = state.prefill_first_chunk.tolist()
+        init_rows = [prefill.first_chunk for prefill in state.prefill_state]
+        if any(init_rows):
             init_uuid = tuple(req_id for req_id, is_first in zip(state.uuid, init_rows) if is_first)
             init_tokens = [
-                state.prompt_tokens[idx, : int(state.prompt_lengths[idx].item())]
+                state.prefill_state[idx].prompt_tokens[: int(state.prefill_state[idx].prompt_length.item())]
                 for idx, is_first in enumerate(init_rows)
                 if is_first
             ]
@@ -142,11 +143,12 @@ class MultiQueryAttention:
         return out
 
     def _prefill_row(self, x_row: torch.Tensor, state: ModelForwardState, idx: int):
-        chunk_len = int(state.lengths[idx].item())
+        prefill = state.prefill_state[idx]
+        chunk_len = int(prefill.length.item())
         if chunk_len == 0:
             return torch.zeros_like(x_row)
 
-        chunk_start = int(state.prefill_offset[idx].item())
+        chunk_start = prefill.offset
         chunk_end = chunk_start + chunk_len
         q = self.q_weights(x_row)
         q = q + self.q_bias if self.q_bias is not None else q

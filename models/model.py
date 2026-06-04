@@ -4,17 +4,23 @@ from dataclasses import dataclass
 import torch
 
 @dataclass(frozen=True)
+class PrefillState:
+    offset: int
+    first_chunk: bool
+    last_chunk: bool
+    prompt_tokens: torch.Tensor
+    prompt_length: torch.Tensor
+    length: torch.Tensor | None = None
+
+@dataclass(frozen=True)
 class ModelForwardState:
     tokens: torch.Tensor
     prefill: bool
-    mask: torch.Tensor | None
-    lengths: torch.Tensor | None
     uuid: tuple[int, ...]
-    prefill_offset: torch.Tensor | None = None
-    prefill_first_chunk: torch.Tensor | None = None
-    prefill_last_chunk: torch.Tensor | None = None
-    prompt_tokens: torch.Tensor | None = None
-    prompt_lengths: torch.Tensor | None = None
+    mask: torch.Tensor | None = None
+    prefill_state : list[PrefillState] | None = None
+
+
 
 class Model(ABC):
     def __init__(self, device: torch.device):
