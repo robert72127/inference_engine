@@ -4,7 +4,7 @@ from torch.nn.utils.rnn import pad_sequence
 import math
 
 from kvcache import RadixKVCache
-from layers.triton_kernels import paged_mqa_decode
+from layers.triton_kernels import paged_mqa_decode, residual_rms
 from models.model import ModelForwardState
 
 class Embedding:
@@ -39,6 +39,21 @@ class RMSNorm:
     def __call__(self, x:torch.Tensor):
         rms = x.pow(2).mean(dim=-1, keepdim=True)
         return self.gamma * x * torch.rsqrt(rms + self.eps)
+
+class ResidualRMSNorm:
+    def __init__(self, gamma_weights:torch.Tensor, eps=1e-6):
+        self.rms_norm = RMSNorm(gamma_weights, eps)
+
+    def __call__(self, x:torch.Tensor, y:torch.Tensor):
+        total = x + y
+        return total, self.rms_norm(total)
+
+class ResidualRMSNormCuda:
+    def __init__(self, gamma_weights:torch.Tensor):
+        self.gamma = gamma_weights
+
+    def __call__(self, x:torch.Tensor, y:torch.Tensor):
+        return residual_rms(x, y, self.gamma)
 
 class RoPe:
     def __init__(self, head_dim:int, max_seq_len:int, base:float, device: torch.device):
@@ -294,14 +309,13 @@ class MultiQueryAttention:
             out[idx] = (acc / l[:, None]).to(out.dtype)
 
 class TransformerBlock:
-    def __init__(self, mlp, pre_norm, attention, post_norm):
+    def __init__(self, mlp, pre_norm, attention, residual_rms):
         self.mlp = mlp
         self.pre_norm = pre_norm
         self.attention = attention
-        self.post_norm = post_norm
+        self.residual_rms = residual_rms
 
     def __call__(self, x:torch.Tensor, state: ModelForwardState):
         attn_in = self.pre_norm(x)
-        x = x + self.attention(attn_in, state)
-        mlp_in = self.post_norm(x)
+        x, mlp_in =  self.residual_rms(x, self.attention(attn_in, state))
         return  x + self.mlp(mlp_in)

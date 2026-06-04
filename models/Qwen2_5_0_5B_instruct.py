@@ -10,6 +10,8 @@ from kvcache import blocks_for_tokens
 from layers.layers import (
     Embedding,
     RMSNorm,
+    ResidualRMSNorm,
+    ResidualRMSNormCuda,
     SwiGLUMlp,
     MultiQueryAttention,
     RoPe,
@@ -146,7 +148,7 @@ def cache_blocks_cnt_from_budget(
         raise RuntimeError("Invalid cache block geometry")
     if memory_left <= 0:
         raise RuntimeError("Not enough memory left for KV cache")
-    return min(max_blocks_cnt, memory_left // bytes_per_block)
+    return int(min(max_blocks_cnt, memory_left // bytes_per_block))
 
 # generates tensor processing graph from safetensor
 def parse_model(
@@ -168,6 +170,7 @@ def parse_model(
         cache_max_seq_len,
         memory_available,
     )
+    print("Cache blocks count:", cache_blocks_cnt)
     if cache_blocks_cnt == 0:
         raise RuntimeError("KV cache budget allows zero cache blocks")
 
@@ -214,7 +217,10 @@ def parse_model(
                 case "input_layernorm":
                     input_layernorm = RMSNorm(layer[sub_layer][0]['array'], eps=cfg.rms_eps) 
                 case "post_attention_layernorm":
-                    post_attention_layernorm = RMSNorm(layer[sub_layer][0]['array'], eps=cfg.rms_eps) 
+                    if device == torch.device("cuda"):
+                        residual_rms = ResidualRMSNormCuda(layer[sub_layer][0]['array'])
+                    else:
+                        residual_rms = ResidualRMSNorm(layer[sub_layer][0]['array'], eps=cfg.rms_eps) 
                 case "mlp":
                     mlp = parse_mlp(layer[sub_layer])
                 case "self_attn":
@@ -230,7 +236,7 @@ def parse_model(
                     )
                     kv_caches.append(self_attn.KV_cache)
                 case _: raise Exception("Unknown layer, aborting")
-        model += [(TransformerBlock(mlp, input_layernorm, self_attn, post_attention_layernorm), True)] 
+        model += [(TransformerBlock(mlp, input_layernorm, self_attn, residual_rms), True)] 
 
     output_layers = [output_norm, output_embed]
 

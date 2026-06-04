@@ -28,7 +28,6 @@ def paged_mqa_decode(
         BLOCK_T=triton.next_power_of_2(seq_len_per_page),
     )
 
-
 @triton.jit
 def paged_mqa_decode_kernel(
     q_ptr, K_cache, V_cache, out_ptr,
@@ -124,3 +123,71 @@ def paged_mqa_decode_kernel(
         out,
         boundary_check=(0,),
     )
+
+def residual_rms(x, y, gamma):
+    batch, seq_len, hidden_dim = x.shape
+    grid = (batch, seq_len)
+    out_rms = torch.empty_like(x)
+    out = torch.empty_like(x)
+    residual_rms_kernel[grid](x, y, gamma, out, out_rms, hidden_dim)
+    return out, out_rms
+
+@triton.jit
+def residual_rms_kernel(x_ptr, y_ptr, rms_weight, out_ptr, out_rms_ptr, HIDDEN_DIM: tl.constexpr):
+    batch_idx = tl.program_id(0)
+    seq_idx = tl.program_id(1)
+    seq_len = tl.num_programs(1)
+    offset =  HIDDEN_DIM * (batch_idx * seq_len + seq_idx)
+
+    x_block_ptr = tl.make_block_ptr(
+        x_ptr + offset,
+        shape=(HIDDEN_DIM,),
+        strides=(1,),
+        offsets=(0,),
+        block_shape=(HIDDEN_DIM,),
+        order=(0,),
+    )
+    y_block_ptr = tl.make_block_ptr(
+        y_ptr + offset,
+        shape=(HIDDEN_DIM,),
+        strides=(1,),
+        offsets=(0,),
+        block_shape=(HIDDEN_DIM,),
+        order=(0,),
+    )
+    gamma_block_ptr = tl.make_block_ptr(
+        rms_weight,
+        shape=(HIDDEN_DIM,),
+        strides=(1,),
+        offsets=(0,),
+        block_shape=(HIDDEN_DIM,),
+        order=(0,),
+    )    
+
+    out_block_ptr = tl.make_block_ptr(
+        out_ptr + offset,
+        shape=(HIDDEN_DIM,),
+        strides=(1,),
+        offsets=(0,),
+        block_shape=(HIDDEN_DIM,),
+        order=(0,),
+    )
+    out_rms_block_ptr = tl.make_block_ptr(
+        out_rms_ptr + offset,
+        shape=(HIDDEN_DIM,),
+        strides=(1,),
+        offsets=(0,),
+        block_shape=(HIDDEN_DIM,),
+        order=(0,),
+    )
+
+    x_block = tl.load(x_block_ptr).to(tl.float32)
+    y_block = tl.load(y_block_ptr).to(tl.float32)
+    gamma_block = tl.load(gamma_block_ptr).to(tl.float32)
+    total = x_block + y_block
+    square = total * total
+    norm = tl.sqrt( (tl.sum(square) / HIDDEN_DIM ) + 1e-6)
+    rms = total / norm * gamma_block
+
+    tl.store(out_block_ptr, total)
+    tl.store(out_rms_block_ptr, rms)
