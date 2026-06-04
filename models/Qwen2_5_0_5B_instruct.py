@@ -217,7 +217,7 @@ def parse_model(
                 case "input_layernorm":
                     input_layernorm = RMSNorm(layer[sub_layer][0]['array'], eps=cfg.rms_eps) 
                 case "post_attention_layernorm":
-                    if device == torch.device("cuda"):
+                    if device.type == "cuda":
                         residual_rms = ResidualRMSNormCuda(layer[sub_layer][0]['array'])
                     else:
                         residual_rms = ResidualRMSNorm(layer[sub_layer][0]['array'], eps=cfg.rms_eps) 

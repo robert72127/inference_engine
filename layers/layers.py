@@ -256,7 +256,7 @@ class MultiQueryAttention:
                     device=Q.device,
                 )
 
-        if x.device == torch.device("cuda"):
+        if x.device.type == "cuda":
 
             page_indexes = [torch.tensor(pm["indexes"], device=x.device) for pm in pages_info]
             padded_indexes = pad_sequence(page_indexes,batch_first=True,padding_value=-1)

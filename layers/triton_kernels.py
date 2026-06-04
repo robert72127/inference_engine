@@ -129,11 +129,19 @@ def residual_rms(x, y, gamma):
     grid = (batch, seq_len)
     out_rms = torch.empty_like(x)
     out = torch.empty_like(x)
-    residual_rms_kernel[grid](x, y, gamma, out, out_rms, hidden_dim)
+    residual_rms_kernel[grid](x, y, gamma, out, out_rms, hidden_dim, BLOCK_H=triton.next_power_of_2(hidden_dim))
     return out, out_rms
 
 @triton.jit
-def residual_rms_kernel(x_ptr, y_ptr, rms_weight, out_ptr, out_rms_ptr, HIDDEN_DIM: tl.constexpr):
+def residual_rms_kernel(
+    x_ptr,
+    y_ptr,
+    rms_weight,
+    out_ptr,
+    out_rms_ptr,
+    HIDDEN_DIM: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
     batch_idx = tl.program_id(0)
     seq_idx = tl.program_id(1)
     seq_len = tl.num_programs(1)
@@ -144,7 +152,7 @@ def residual_rms_kernel(x_ptr, y_ptr, rms_weight, out_ptr, out_rms_ptr, HIDDEN_D
         shape=(HIDDEN_DIM,),
         strides=(1,),
         offsets=(0,),
-        block_shape=(HIDDEN_DIM,),
+        block_shape=(BLOCK_H,),
         order=(0,),
     )
     y_block_ptr = tl.make_block_ptr(
@@ -152,7 +160,7 @@ def residual_rms_kernel(x_ptr, y_ptr, rms_weight, out_ptr, out_rms_ptr, HIDDEN_D
         shape=(HIDDEN_DIM,),
         strides=(1,),
         offsets=(0,),
-        block_shape=(HIDDEN_DIM,),
+        block_shape=(BLOCK_H,),
         order=(0,),
     )
     gamma_block_ptr = tl.make_block_ptr(
@@ -160,16 +168,16 @@ def residual_rms_kernel(x_ptr, y_ptr, rms_weight, out_ptr, out_rms_ptr, HIDDEN_D
         shape=(HIDDEN_DIM,),
         strides=(1,),
         offsets=(0,),
-        block_shape=(HIDDEN_DIM,),
+        block_shape=(BLOCK_H,),
         order=(0,),
-    )    
+    )
 
     out_block_ptr = tl.make_block_ptr(
         out_ptr + offset,
         shape=(HIDDEN_DIM,),
         strides=(1,),
         offsets=(0,),
-        block_shape=(HIDDEN_DIM,),
+        block_shape=(BLOCK_H,),
         order=(0,),
     )
     out_rms_block_ptr = tl.make_block_ptr(
@@ -177,17 +185,17 @@ def residual_rms_kernel(x_ptr, y_ptr, rms_weight, out_ptr, out_rms_ptr, HIDDEN_D
         shape=(HIDDEN_DIM,),
         strides=(1,),
         offsets=(0,),
-        block_shape=(HIDDEN_DIM,),
+        block_shape=(BLOCK_H,),
         order=(0,),
     )
 
-    x_block = tl.load(x_block_ptr).to(tl.float32)
-    y_block = tl.load(y_block_ptr).to(tl.float32)
-    gamma_block = tl.load(gamma_block_ptr).to(tl.float32)
+    x_block = tl.load(x_block_ptr, boundary_check=(0,), padding_option="zeros").to(tl.float32)
+    y_block = tl.load(y_block_ptr, boundary_check=(0,), padding_option="zeros").to(tl.float32)
+    gamma_block = tl.load(gamma_block_ptr, boundary_check=(0,), padding_option="zeros").to(tl.float32)
     total = x_block + y_block
     square = total * total
     norm = tl.sqrt( (tl.sum(square) / HIDDEN_DIM ) + 1e-6)
     rms = total / norm * gamma_block
 
-    tl.store(out_block_ptr, total)
-    tl.store(out_rms_block_ptr, rms)
+    tl.store(out_block_ptr, total, boundary_check=(0,))
+    tl.store(out_rms_block_ptr, rms, boundary_check=(0,))

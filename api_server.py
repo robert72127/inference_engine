@@ -139,7 +139,7 @@ async def chat(req: ChatCompletionRequest):
                     case GenDelta():
                         yield f"data: {json.dumps(chunk_payload(completion_id, created, req.model, {'content': ev.text}))}\n\n"
             
-            yield f"data: {json.dumps(chunk_payload(completion_id, created, req.model, {}, 'stop') | {"usage": get_usage(prompt_tokens, completion_tokens)})}\n\n"
+            yield f"data: {json.dumps(chunk_payload(completion_id, created, req.model, {}, 'stop') | {'usage': get_usage(prompt_tokens, completion_tokens)})}\n\n"
             yield "data: [DONE]\n\n"
             
             Logger.info("Chat completion streamed id=%s", completion_id)
