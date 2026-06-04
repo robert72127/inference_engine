@@ -125,92 +125,87 @@ class MultiQueryAttention:
             return self._prefill(x, state)
         return self._generate(x, state)
 
-
     def _prefill(self, x:torch.Tensor, state: ModelForwardState):
-        init_rows = [prefill.first_chunk for prefill in state.prefill_state]
-        if any(init_rows):
-            init_uuid = tuple(req_id for req_id, is_first in zip(state.uuid, init_rows) if is_first)
-            init_tokens = [
-                state.prefill_state[idx].prompt_tokens[: int(state.prefill_state[idx].prompt_length.item())]
-                for idx, is_first in enumerate(init_rows)
-                if is_first
-            ]
-            self.KV_cache.init(init_uuid, init_tokens)
+        batch_size = x.size(0)
+
+        # first call init for any uuids that have the first chunk in this batch
+        init_uuid = []
+        init_tokens = []
+        for bidx in range(batch_size):
+            prefill = state.prefill_state[bidx]
+            if prefill.first_chunk:
+                init_uuid.append(state.uuid[bidx])
+                init_tokens.append(prefill.prompt_tokens)
+        if init_uuid:
+            self.KV_cache.init(tuple(init_uuid), init_tokens)
 
         out = torch.zeros_like(x)
-        for idx in range(x.size(0)):
-            out[idx:idx + 1] = self._prefill_row(x[idx:idx + 1], state, idx)
-        return out
+        for bidx in range(batch_size):
+            prefill = state.prefill_state[bidx]
+            chunk_len = int(prefill.length.item())
+            if chunk_len == 0:
+                continue
 
-    def _prefill_row(self, x_row: torch.Tensor, state: ModelForwardState, idx: int):
-        prefill = state.prefill_state[idx]
-        chunk_len = int(prefill.length.item())
-        if chunk_len == 0:
-            return torch.zeros_like(x_row)
+            chunk_start = prefill.offset
+            chunk_end = chunk_start + chunk_len
+            row = x[bidx:bidx + 1, :chunk_len, :]
 
-        chunk_start = prefill.offset
-        chunk_end = chunk_start + chunk_len
-        q = self.q_weights(x_row)
-        q = q + self.q_bias if self.q_bias is not None else q
-        qh = rearrange(q, "b l (h d) -> b h l d", h=self.num_attn_heads)
-        if self.rope is not None:
-            q_positions = torch.arange(chunk_start, chunk_end, device=x_row.device).unsqueeze(0)
-            qh = self.rope(qh, position=q_positions)
-
-        kh, vh = self._materialize_prefill_kv_row(x_row, state, idx, chunk_start, chunk_end)
-        group = self.num_attn_heads // self.num_kv_heads
-        qg = qh[0, :, :chunk_len, :].view(self.num_kv_heads, group, chunk_len, self.head_dim)
-        kg = kh.unsqueeze(1)
-        vg = vh.unsqueeze(1)
-        attn_scores = torch.matmul(qg, kg.transpose(-1, -2)) / math.sqrt(self.head_dim)
-        query_positions = torch.arange(chunk_start, chunk_end, device=attn_scores.device)
-        key_positions = torch.arange(chunk_end, device=attn_scores.device)
-        causal = key_positions.unsqueeze(0) > query_positions.unsqueeze(1)
-        attn_scores = attn_scores.masked_fill(causal[None, None, :, :], float("-inf"))
-        attn = attn_scores.softmax(dim=-1)
-        out_g = torch.matmul(attn, vg)
-        out_heads = rearrange(out_g, "h_kv g l d -> l (h_kv g d)")
-        row_out = torch.zeros_like(x_row)
-        row_out[0, :chunk_len, :] = self.outproj(out_heads.unsqueeze(0))[0]
-        return row_out
-
-    def _materialize_prefill_kv_row(self, x_row: torch.Tensor, state: ModelForwardState, idx: int, chunk_start: int, chunk_end: int):
-        chunk_len = chunk_end - chunk_start
-        pages_info, cached_chunk_tokens = self.KV_cache.get_prefill_chunk_info(
-            state.uuid[idx],
-            chunk_start,
-            chunk_len,
-        )
-        cached_tokens = chunk_start + cached_chunk_tokens
-
-        kh = torch.zeros((self.num_kv_heads, chunk_end, self.head_dim), device=x_row.device, dtype=x_row.dtype)
-        vh = torch.zeros_like(kh)
-        if cached_tokens > 0:
-            self._load_cached_prefix(kh, vh, pages_info["indexes"], cached_tokens)
-
-        local_start = cached_chunk_tokens
-        if local_start < chunk_len:
-            suffix_x = x_row[:, local_start:chunk_len, :]
-            k = self.k_weights(suffix_x)
-            v = self.v_weights(suffix_x)
-            k = k + self.k_bias if self.k_bias is not None else k
-            v = v + self.v_bias if self.v_bias is not None else v
-            k_suffix = rearrange(k, "b l (h d) -> b h l d", h=self.num_kv_heads)
-            v_suffix = rearrange(v, "b l (h d) -> b h l d", h=self.num_kv_heads)
+            q = self.q_weights(row)
+            q = q + self.q_bias if self.q_bias is not None else q
+            qh = rearrange(q, "b l (h d) -> b h l d", h=self.num_attn_heads)
             if self.rope is not None:
-                suffix_positions = torch.arange(chunk_start + local_start, chunk_end, device=x_row.device).unsqueeze(0)
-                k_suffix = self.rope(k_suffix, position=suffix_positions)
-            kh[:, chunk_start + local_start:chunk_end, :] = k_suffix[0]
-            vh[:, chunk_start + local_start:chunk_end, :] = v_suffix[0]
-            write_len = chunk_len - local_start
-            self.KV_cache.prefill(
-                (state.uuid[idx],),
-                state.tokens[idx:idx + 1, local_start:chunk_len],
-                k_suffix,
-                v_suffix,
-                torch.ones((1, write_len), device=state.tokens.device, dtype=torch.bool),
+                q_positions = torch.arange(chunk_start, chunk_end, device=row.device).unsqueeze(0)
+                qh = self.rope(qh, position=q_positions)
+
+            pages_info, cached_chunk_tokens = self.KV_cache.get_prefill_chunk_info(
+                state.uuid[bidx],
+                chunk_start,
+                chunk_len,
             )
-        return kh, vh
+            cached_tokens = chunk_start + cached_chunk_tokens
+            kh = torch.zeros((self.num_kv_heads, chunk_end, self.head_dim), device=row.device, dtype=row.dtype)
+            vh = torch.zeros_like(kh)
+            if cached_tokens > 0:
+                self._load_cached_prefix(kh, vh, pages_info["indexes"], cached_tokens)
+
+            local_start = cached_chunk_tokens
+            if local_start < chunk_len:
+                suffix_x = row[:, local_start:chunk_len, :]
+                k = self.k_weights(suffix_x)
+                v = self.v_weights(suffix_x)
+                k = k + self.k_bias if self.k_bias is not None else k
+                v = v + self.v_bias if self.v_bias is not None else v
+                k_suffix = rearrange(k, "b l (h d) -> b h l d", h=self.num_kv_heads)
+                v_suffix = rearrange(v, "b l (h d) -> b h l d", h=self.num_kv_heads)
+                if self.rope is not None:
+                    suffix_positions = torch.arange(chunk_start + local_start, chunk_end, device=row.device).unsqueeze(0)
+                    k_suffix = self.rope(k_suffix, position=suffix_positions)
+                kh[:, chunk_start + local_start:chunk_end, :] = k_suffix[0]
+                vh[:, chunk_start + local_start:chunk_end, :] = v_suffix[0]
+                write_len = chunk_len - local_start
+                self.KV_cache.prefill(
+                    (state.uuid[bidx],),
+                    state.tokens[bidx:bidx + 1, local_start:chunk_len],
+                    k_suffix,
+                    v_suffix,
+                    torch.ones((1, write_len), device=state.tokens.device, dtype=torch.bool),
+                )
+
+            group = self.num_attn_heads // self.num_kv_heads
+            qg = qh[0].view(self.num_kv_heads, group, chunk_len, self.head_dim)
+            kg = kh.unsqueeze(1)
+            vg = vh.unsqueeze(1)
+            attn_scores = torch.matmul(qg, kg.transpose(-1, -2)) / math.sqrt(self.head_dim)
+            query_positions = torch.arange(chunk_start, chunk_end, device=attn_scores.device)
+            key_positions = torch.arange(chunk_end, device=attn_scores.device)
+            causal = key_positions.unsqueeze(0) > query_positions.unsqueeze(1)
+            attn_scores = attn_scores.masked_fill(causal[None, None, :, :], float("-inf"))
+            attn = attn_scores.softmax(dim=-1)
+            out_g = torch.matmul(attn, vg)
+            out_heads = rearrange(out_g, "h_kv g l d -> l (h_kv g d)")
+            out[bidx:bidx + 1, :chunk_len, :] = self.outproj(out_heads.unsqueeze(0))
+        
+        return out
 
     def _load_cached_prefix(self, kh: torch.Tensor, vh: torch.Tensor, indexes, cached_tokens: int):
         tokens_seen = 0

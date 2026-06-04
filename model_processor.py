@@ -289,7 +289,6 @@ class ModelProcessor:
                         first_chunk=handle.prefill_pos == 0,
                         last_chunk=end == handle.tokens.size(0),
                         prompt_tokens=handle.tokens,
-                        prompt_length=torch.tensor(handle.tokens.size(0), device=self.device),
                         length=torch.tensor(chunk_tokens.size(0), device=self.device),
                     )
                 )

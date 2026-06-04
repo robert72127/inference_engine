@@ -9,7 +9,6 @@ class PrefillState:
     first_chunk: bool
     last_chunk: bool
     prompt_tokens: torch.Tensor
-    prompt_length: torch.Tensor
     length: torch.Tensor | None = None
 
 @dataclass(frozen=True)
