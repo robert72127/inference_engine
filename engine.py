@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from enum import Enum
 import os
 import importlib
@@ -8,6 +9,21 @@ from utils.logger import Logger
 from tokenizer import Tokenizer
 from model_processor import ModelProcessor
 from models import MODEL, models
+
+
+@dataclass
+class GenStart:
+    prompt_tokens: int
+
+
+@dataclass
+class GenDelta:
+    text: str
+
+
+@dataclass
+class GenEnd:
+    completion_tokens: int
 
 CPU_SYSTEM_RESERVE_GB = 6
 CUDA_MEMORY_FRACTION = 1.0
@@ -107,28 +123,48 @@ class Engine:
         self.next_worker = (self.next_worker + 1) % self.model_workers_cnt
         return worker
 
-    async def generate(self, message, max_tokens, temperature=1.0, top_p=1.0):
-        out = []
-        async for delta in self.generate_stream(message, max_tokens, temperature=temperature, top_p=top_p):
-            out.append(delta)
-        return "".join(out)
-
-    async def generate_stream(self, message, max_tokens, temperature=1.0, top_p=1.0):
+    async def _setup_generation(self, message, max_tokens, temperature, top_p):
         prompt = self.apply_prompt_template(message)
         tokenized = await self.tokenizer.tokenize([prompt])
         tokens = tokenized["input_ids"][0]
+        prompt_tokens = int(tokens.size(0))
 
         backend = self.schedule()
-        Logger.debug("Scheduled request prompt_tokens=%d max_tokens=%d", tokens.size(0), max_tokens)
-
+        Logger.debug("Scheduled request prompt_tokens=%d max_tokens=%d", prompt_tokens, max_tokens)
         handle = await backend.prefill(tokens, temperature=temperature, top_p=top_p, max_new_tokens=max_tokens)
+        return backend, handle, prompt_tokens
 
+    async def generate_stream(self, message, max_tokens, temperature=1.0, top_p=1.0):
+        backend, handle, prompt_tokens = await self._setup_generation(message, max_tokens, temperature, top_p)
+
+        yield GenStart(prompt_tokens=prompt_tokens)
+
+        completion_tokens = 0
         for _ in range(max_tokens):
             tok = await backend.next_token(handle)
-
             if tok == self.tokenizer.tokenizer.eos_token_id:
                 break
 
-            yield self.tokenizer.detokenize_sync([[tok]])[0]
+            yield GenDelta(text=self.tokenizer.detokenize_sync([[tok]])[0])
+
+            completion_tokens += 1
+
+        yield GenEnd(completion_tokens=completion_tokens)
 
         await backend.release(handle)
+
+    async def generate(self, message, max_tokens, temperature=1.0, top_p=1.0) -> tuple[str, int, int]:
+        parts: list[str] = []
+        prompt_tokens = 0
+        completion_tokens = 0
+
+        async for ev in self.generate_stream(message, max_tokens, temperature=temperature, top_p=top_p):
+            match ev:
+                case GenStart():
+                    prompt_tokens = ev.prompt_tokens
+                case GenDelta():
+                    parts.append(ev.text)
+                case GenEnd():
+                    completion_tokens = ev.completion_tokens
+
+        return "".join(parts), prompt_tokens, completion_tokens
