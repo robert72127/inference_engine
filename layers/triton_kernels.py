@@ -197,5 +197,5 @@ def residual_rms_kernel(
     norm = tl.sqrt( (tl.sum(square) / HIDDEN_DIM ) + 1e-6)
     rms = total / norm * gamma_block
 
-    tl.store(out_block_ptr, total, boundary_check=(0,))
-    tl.store(out_rms_block_ptr, rms, boundary_check=(0,))
+    tl.store(out_block_ptr, total.to(out_ptr.dtype.element_ty), boundary_check=(0,))
+    tl.store(out_rms_block_ptr, rms.to(out_rms_ptr.dtype.element_ty), boundary_check=(0,))
