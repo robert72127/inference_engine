@@ -67,7 +67,7 @@ def paged_mqa_decode_kernel(
         block_shape=(BLOCK_D,),
         order=(0,),
     )
-    q_block = tl.load(q_block_ptr, boundary_check=(0,), padding_option="zeros")
+    q_block = tl.load(q_block_ptr, boundary_check=(0,), padding_option="zero")
 
     m_max = -float("inf")
     l = 0
@@ -98,8 +98,8 @@ def paged_mqa_decode_kernel(
             block_shape=(BLOCK_T, BLOCK_D),
             order=(1, 0),
         )
-        k_block = tl.load(k_block_ptr, boundary_check=(0,), padding_option="zeros")
-        v_block = tl.load(v_block_ptr, boundary_check=(0,), padding_option="zeros")
+        k_block = tl.load(k_block_ptr, boundary_check=(0,), padding_option="zero")
+        v_block = tl.load(v_block_ptr, boundary_check=(0,), padding_option="zero")
 
         scores = tl.sum(k_block * q_block[None, :], axis=1) * scale
         scores = tl.where(valid_mask, scores, -float("inf"))
@@ -189,9 +189,9 @@ def residual_rms_kernel(
         order=(0,),
     )
 
-    x_block = tl.load(x_block_ptr, boundary_check=(0,), padding_option="zeros").to(tl.float32)
-    y_block = tl.load(y_block_ptr, boundary_check=(0,), padding_option="zeros").to(tl.float32)
-    gamma_block = tl.load(gamma_block_ptr, boundary_check=(0,), padding_option="zeros").to(tl.float32)
+    x_block = tl.load(x_block_ptr, boundary_check=(0,), padding_option="zero").to(tl.float32)
+    y_block = tl.load(y_block_ptr, boundary_check=(0,), padding_option="zero").to(tl.float32)
+    gamma_block = tl.load(gamma_block_ptr, boundary_check=(0,), padding_option="zero").to(tl.float32)
     total = x_block + y_block
     square = total * total
     norm = tl.sqrt( (tl.sum(square) / HIDDEN_DIM ) + 1e-6)
