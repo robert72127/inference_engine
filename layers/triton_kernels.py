@@ -69,8 +69,8 @@ def paged_mqa_decode_kernel(
     )
     q_block = tl.load(q_block_ptr, boundary_check=(0,), padding_option="zero")
 
-    m_max = -float("inf")
-    l = 0
+    m_max = tl.full((), -float("inf"), dtype=tl.float32)
+    l = tl.full((), 0.0, dtype=tl.float32)
     acc = tl.zeros((BLOCK_D,), dtype=tl.float32)
     scale = 1.0 / tl.sqrt(d_head + 0.0)
 
@@ -120,7 +120,7 @@ def paged_mqa_decode_kernel(
     
     tl.store(
         out_block_ptr,
-        out,
+        out.to(out_ptr.dtype.element_ty),
         boundary_check=(0,),
     )
 
