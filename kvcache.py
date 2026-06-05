@@ -162,14 +162,15 @@ class RadixKVCache:
             self.write_block_toks = []
 
         def append_chunk_tokens(self, toks, K, V, src_idx, token_count):
-            for _ in range(token_count):
-                in_block_idx = self.write_block_occupancy
-                self.kv_cache.K[self.write_block][:, in_block_idx, :] = K[:, src_idx, :]
-                self.kv_cache.V[self.write_block][:, in_block_idx, :] = V[:, src_idx, :]
-                self.write_block_toks.append(int(toks[src_idx].item()))
-                self.write_block_occupancy += 1
-                src_idx += 1
-            return src_idx
+            dst_start = self.write_block_occupancy
+            dst_end = dst_start + token_count
+            src_end = src_idx + token_count
+
+            self.kv_cache.K[self.write_block][:, dst_start:dst_end, :] = K[:, src_idx:src_end, :]
+            self.kv_cache.V[self.write_block][:, dst_start:dst_end, :] = V[:, src_idx:src_end, :]
+            self.write_block_toks.extend(int(tok) for tok in toks[src_idx:src_end].detach().cpu().tolist())
+            self.write_block_occupancy = dst_end
+            return src_end
 
     def __init__(self, d_head, head_cnt, num_blocks, block_size, max_requests_per_uuid=None, device=None, dtype=None):
         self.d_head = d_head
@@ -261,8 +262,6 @@ class RadixKVCache:
         return self.block_allocator.free_slots_cnt + len(self.block_allocator.evictable_blocks) - reserved
 
     def _block_keys_for_tokens(self, toks):
-        if torch.is_tensor(toks):
-            toks = toks.tolist()
         return [
             toks[i:i + self.block_size]
             for i in range(0, len(toks) - len(toks) % self.block_size, self.block_size)
@@ -316,16 +315,9 @@ class RadixKVCache:
                     uuid_state.commit_write_block()
 
     def append_and_fetch(self, uuids, K, V, toks):
-        max_len = 0
-        batch_size = 0
-        lengths = []
         pages_info = []
         for i, uuid in enumerate(uuids):
             uuid_state = self.uuids[uuid]
             uuid_state.insert_single(toks[i], K[i, :, 0, :], V[i, :, 0, :])
-            length = (uuid_state.blocks_count - 1) * self.block_size + uuid_state.write_block_occupancy
-            max_len = max(max_len, length)
-            lengths.append(length)
-            batch_size += 1
-            pages_info += [uuid_state.get_pages_info()]
+            pages_info.append(uuid_state.get_pages_info())
         return pages_info

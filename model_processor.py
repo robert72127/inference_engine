@@ -25,12 +25,14 @@ class ServerHandle:
         self,
         handle_id: int,
         tokens: torch.Tensor,
+        prompt_tokens: list[int],
         temperature: float,
         top_p: float,
         max_new_tokens: int,
     ):
         self.id = handle_id
         self.tokens = tokens
+        self.prompt_tokens = prompt_tokens
         self.temperature = temperature
         self.top_p = top_p
         self.cache_len = int(tokens.size(0))
@@ -134,7 +136,7 @@ async def run_model_server(endpoint: str, processor: "ModelProcessor"):
 
         if op == "PREFILL":
             result = await processor.prefill(
-                payload["tokens"],
+                torch.tensor(payload["tokens"], dtype=torch.long),
                 temperature=payload.get("temperature", 1.0),
                 top_p=payload.get("top_p", 1.0),
                 max_new_tokens=payload.get("max_new_tokens"),
@@ -211,15 +213,13 @@ class ModelProcessor:
 
     async def prefill(
         self,
-        tokens: list[int],
+        tokens: torch.Tensor,
         temperature: float = 1.0,
         top_p: float = 1.0,
         max_new_tokens: int | None = None,
     ):
-        if isinstance(tokens, torch.Tensor):
-            tokens_t = tokens.detach().clone().to(device=self.device, dtype=torch.long)
-        else:
-            tokens_t = torch.tensor(tokens, device=self.device, dtype=torch.long)
+        prompt_tokens = [int(tok) for tok in tokens.detach().cpu().tolist()]
+        tokens_t = tokens.to(device=self.device)
 
         prompt_len = int(tokens_t.size(0))
         if prompt_len > self.max_request_len:
@@ -236,6 +236,7 @@ class ModelProcessor:
             handle = ServerHandle(
                 handle_id,
                 tokens_t,
+                prompt_tokens,
                 temperature=temperature,
                 top_p=top_p,
                 max_new_tokens=max_new_tokens,
@@ -288,7 +289,7 @@ class ModelProcessor:
                         offset=handle.prefill_pos,
                         first_chunk=handle.prefill_pos == 0,
                         last_chunk=end == handle.tokens.size(0),
-                        prompt_tokens=handle.tokens,
+                        prompt_tokens=handle.prompt_tokens,
                         length=torch.tensor(chunk_tokens.size(0), device=self.device),
                     )
                 )

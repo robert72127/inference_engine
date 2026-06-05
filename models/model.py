@@ -8,7 +8,7 @@ class PrefillState:
     offset: int
     first_chunk: bool
     last_chunk: bool
-    prompt_tokens: torch.Tensor
+    prompt_tokens: list[int]
     length: torch.Tensor | None = None
 
 @dataclass(frozen=True)
