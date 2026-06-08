@@ -28,7 +28,6 @@ def paged_mqa_decode(
         BLOCK_T=triton.next_power_of_2(seq_len_per_page),
     )
 
-
 @triton.jit
 def paged_mqa_decode_kernel(
     q_ptr, K_cache, V_cache, out_ptr,
@@ -68,10 +67,10 @@ def paged_mqa_decode_kernel(
         block_shape=(BLOCK_D,),
         order=(0,),
     )
-    q_block = tl.load(q_block_ptr, boundary_check=(0,), padding_option="zeros")
+    q_block = tl.load(q_block_ptr, boundary_check=(0,), padding_option="zero")
 
-    m_max = -float("inf")
-    l = 0
+    m_max = tl.full((), -float("inf"), dtype=tl.float32)
+    l = tl.full((), 0.0, dtype=tl.float32)
     acc = tl.zeros((BLOCK_D,), dtype=tl.float32)
     scale = 1.0 / tl.sqrt(d_head + 0.0)
 
@@ -99,8 +98,8 @@ def paged_mqa_decode_kernel(
             block_shape=(BLOCK_T, BLOCK_D),
             order=(1, 0),
         )
-        k_block = tl.load(k_block_ptr, boundary_check=(0,), padding_option="zeros")
-        v_block = tl.load(v_block_ptr, boundary_check=(0,), padding_option="zeros")
+        k_block = tl.load(k_block_ptr, boundary_check=(0,), padding_option="zero")
+        v_block = tl.load(v_block_ptr, boundary_check=(0,), padding_option="zero")
 
         scores = tl.sum(k_block * q_block[None, :], axis=1) * scale
         scores = tl.where(valid_mask, scores, -float("inf"))
@@ -121,6 +120,82 @@ def paged_mqa_decode_kernel(
     
     tl.store(
         out_block_ptr,
-        out,
+        out.to(out_ptr.dtype.element_ty),
         boundary_check=(0,),
     )
+
+def residual_rms(x, y, gamma):
+    batch, seq_len, hidden_dim = x.shape
+    grid = (batch, seq_len)
+    out_rms = torch.empty_like(x)
+    out = torch.empty_like(x)
+    residual_rms_kernel[grid](x, y, gamma, out, out_rms, hidden_dim, BLOCK_H=triton.next_power_of_2(hidden_dim))
+    return out, out_rms
+
+@triton.jit
+def residual_rms_kernel(
+    x_ptr,
+    y_ptr,
+    rms_weight,
+    out_ptr,
+    out_rms_ptr,
+    HIDDEN_DIM: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    batch_idx = tl.program_id(0)
+    seq_idx = tl.program_id(1)
+    seq_len = tl.num_programs(1)
+    offset =  HIDDEN_DIM * (batch_idx * seq_len + seq_idx)
+
+    x_block_ptr = tl.make_block_ptr(
+        x_ptr + offset,
+        shape=(HIDDEN_DIM,),
+        strides=(1,),
+        offsets=(0,),
+        block_shape=(BLOCK_H,),
+        order=(0,),
+    )
+    y_block_ptr = tl.make_block_ptr(
+        y_ptr + offset,
+        shape=(HIDDEN_DIM,),
+        strides=(1,),
+        offsets=(0,),
+        block_shape=(BLOCK_H,),
+        order=(0,),
+    )
+    gamma_block_ptr = tl.make_block_ptr(
+        rms_weight,
+        shape=(HIDDEN_DIM,),
+        strides=(1,),
+        offsets=(0,),
+        block_shape=(BLOCK_H,),
+        order=(0,),
+    )
+
+    out_block_ptr = tl.make_block_ptr(
+        out_ptr + offset,
+        shape=(HIDDEN_DIM,),
+        strides=(1,),
+        offsets=(0,),
+        block_shape=(BLOCK_H,),
+        order=(0,),
+    )
+    out_rms_block_ptr = tl.make_block_ptr(
+        out_rms_ptr + offset,
+        shape=(HIDDEN_DIM,),
+        strides=(1,),
+        offsets=(0,),
+        block_shape=(BLOCK_H,),
+        order=(0,),
+    )
+
+    x_block = tl.load(x_block_ptr, boundary_check=(0,), padding_option="zero").to(tl.float32)
+    y_block = tl.load(y_block_ptr, boundary_check=(0,), padding_option="zero").to(tl.float32)
+    gamma_block = tl.load(gamma_block_ptr, boundary_check=(0,), padding_option="zero").to(tl.float32)
+    total = x_block + y_block
+    square = total * total
+    norm = tl.sqrt( (tl.sum(square) / HIDDEN_DIM ) + 1e-6)
+    rms = total / norm * gamma_block
+
+    tl.store(out_block_ptr, total.to(out_ptr.dtype.element_ty), boundary_check=(0,))
+    tl.store(out_rms_block_ptr, rms.to(out_rms_ptr.dtype.element_ty), boundary_check=(0,))

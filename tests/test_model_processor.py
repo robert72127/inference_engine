@@ -46,7 +46,9 @@ class FakeConcurrentModel:
             device=self.device,
         )
         if state.prefill:
-            self.prefill_last_chunk_calls.append(state.prefill_last_chunk.tolist())
+            self.prefill_last_chunk_calls.append(
+                [prefill.last_chunk for prefill in state.prefill_state]
+            )
             logits[:, 1] = 0.0
         else:
             self.generate_calls += 1
@@ -64,8 +66,8 @@ class DecodeBatchTests(unittest.TestCase):
             dtype=torch.float32,
         )
         batch = [
-            ServerHandle(0, torch.tensor([1]), temperature=0.0, top_p=1.0, max_new_tokens=1),
-            ServerHandle(1, torch.tensor([2]), temperature=0.0, top_p=1.0, max_new_tokens=1),
+            ServerHandle(0, torch.tensor([1]), [1], temperature=0.0, top_p=1.0, max_new_tokens=1),
+            ServerHandle(1, torch.tensor([2]), [2], temperature=0.0, top_p=1.0, max_new_tokens=1),
         ]
 
         out = self.processor._decode_batch(logits, batch)
@@ -79,8 +81,8 @@ class DecodeBatchTests(unittest.TestCase):
             dtype=torch.float32,
         )
         batch = [
-            ServerHandle(0, torch.tensor([1]), temperature=1.0, top_p=1.0, max_new_tokens=1),
-            ServerHandle(1, torch.tensor([2]), temperature=1.0, top_p=1.0, max_new_tokens=1),
+            ServerHandle(0, torch.tensor([1]), [1], temperature=1.0, top_p=1.0, max_new_tokens=1),
+            ServerHandle(1, torch.tensor([2]), [2], temperature=1.0, top_p=1.0, max_new_tokens=1),
         ]
 
         out = self.processor._decode_batch(logits, batch)
@@ -120,8 +122,8 @@ class DecodeBatchTests(unittest.TestCase):
             dtype=torch.float32,
         )
         batch = [
-            ServerHandle(0, torch.tensor([1]), temperature=0.0, top_p=1.0, max_new_tokens=1),
-            ServerHandle(1, torch.tensor([2]), temperature=0.8, top_p=0.9, max_new_tokens=1),
+            ServerHandle(0, torch.tensor([1]), [1], temperature=0.0, top_p=1.0, max_new_tokens=1),
+            ServerHandle(1, torch.tensor([2]), [2], temperature=0.8, top_p=0.9, max_new_tokens=1),
         ]
 
         out = self.processor._decode_batch(logits, batch)
@@ -140,47 +142,47 @@ class PrefillChunkSizerTests(unittest.TestCase):
         self.processor.generating = []
 
     def test_make_batch_uses_full_remaining_prompt_for_single_request_without_waiters(self):
-        handle = ServerHandle(0, torch.tensor([11, 12, 13]), temperature=0.0, top_p=1.0, max_new_tokens=1)
+        handle = ServerHandle(0, torch.tensor([11, 12, 13]), [11, 12, 13], temperature=0.0, top_p=1.0, max_new_tokens=1)
 
         input_ids, state = self.processor._make_batch([handle], OP.PREFILL)
 
         self.assertTrue(torch.equal(input_ids, torch.tensor([[11, 12, 13]])))
-        self.assertTrue(torch.equal(state.lengths, torch.tensor([3])))
-        self.assertTrue(torch.equal(state.prefill_last_chunk, torch.tensor([True])))
+        self.assertEqual([prefill.length.item() for prefill in state.prefill_state], [3])
+        self.assertEqual([prefill.last_chunk for prefill in state.prefill_state], [True])
 
     def test_make_batch_uses_block_sized_chunks_when_other_prefill_waiters_exist(self):
-        handle = ServerHandle(0, torch.tensor([11, 12, 13]), temperature=0.0, top_p=1.0, max_new_tokens=1)
-        self.processor.generating = [ServerHandle(1, torch.tensor([21]), temperature=0.0, top_p=1.0, max_new_tokens=1)]
+        handle = ServerHandle(0, torch.tensor([11, 12, 13]), [11, 12, 13], temperature=0.0, top_p=1.0, max_new_tokens=1)
+        self.processor.generating = [ServerHandle(1, torch.tensor([21]), [21], temperature=0.0, top_p=1.0, max_new_tokens=1)]
 
         input_ids, state = self.processor._make_batch([handle], OP.PREFILL)
 
         self.assertTrue(torch.equal(input_ids, torch.tensor([[11, 12]])))
-        self.assertTrue(torch.equal(state.lengths, torch.tensor([2])))
-        self.assertTrue(torch.equal(state.prefill_last_chunk, torch.tensor([False])))
+        self.assertEqual([prefill.length.item() for prefill in state.prefill_state], [2])
+        self.assertEqual([prefill.last_chunk for prefill in state.prefill_state], [False])
 
     def test_make_batch_uses_full_chunk_for_similar_prefill_batch_when_generate_is_empty(self):
         batch = [
-            ServerHandle(0, torch.tensor([11, 12, 13]), temperature=0.0, top_p=1.0, max_new_tokens=1),
-            ServerHandle(1, torch.tensor([21, 22]), temperature=0.0, top_p=1.0, max_new_tokens=1),
+            ServerHandle(0, torch.tensor([11, 12, 13]), [11, 12, 13], temperature=0.0, top_p=1.0, max_new_tokens=1),
+            ServerHandle(1, torch.tensor([21, 22]), [21, 22], temperature=0.0, top_p=1.0, max_new_tokens=1),
         ]
 
         input_ids, state = self.processor._make_batch(batch, OP.PREFILL)
 
         self.assertTrue(torch.equal(input_ids, torch.tensor([[11, 12, 13], [21, 22, 0]])))
-        self.assertTrue(torch.equal(state.lengths, torch.tensor([3, 2])))
-        self.assertTrue(torch.equal(state.prefill_last_chunk, torch.tensor([True, True])))
+        self.assertEqual([prefill.length.item() for prefill in state.prefill_state], [3, 2])
+        self.assertEqual([prefill.last_chunk for prefill in state.prefill_state], [True, True])
 
     def test_make_batch_uses_default_chunk_for_dissimilar_prefill_batch(self):
         batch = [
-            ServerHandle(0, torch.tensor([11, 12, 13, 14, 15]), temperature=0.0, top_p=1.0, max_new_tokens=1),
-            ServerHandle(1, torch.tensor([21, 22]), temperature=0.0, top_p=1.0, max_new_tokens=1),
+            ServerHandle(0, torch.tensor([11, 12, 13, 14, 15]), [11, 12, 13, 14, 15], temperature=0.0, top_p=1.0, max_new_tokens=1),
+            ServerHandle(1, torch.tensor([21, 22]), [21, 22], temperature=0.0, top_p=1.0, max_new_tokens=1),
         ]
 
         input_ids, state = self.processor._make_batch(batch, OP.PREFILL)
 
         self.assertTrue(torch.equal(input_ids, torch.tensor([[11, 12], [21, 22]])))
-        self.assertTrue(torch.equal(state.lengths, torch.tensor([2, 2])))
-        self.assertTrue(torch.equal(state.prefill_last_chunk, torch.tensor([False, True])))
+        self.assertEqual([prefill.length.item() for prefill in state.prefill_state], [2, 2])
+        self.assertEqual([prefill.last_chunk for prefill in state.prefill_state], [False, True])
 
 
 class ModelProcessorConcurrencyTests(unittest.IsolatedAsyncioTestCase):
@@ -195,9 +197,9 @@ class ModelProcessorConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         )
 
         handle_ids = await asyncio.gather(
-            processor.prefill([11, 12, 13], temperature=0.0, top_p=1.0),
-            processor.prefill([21, 22], temperature=0.0, top_p=1.0),
-            processor.prefill([31], temperature=0.0, top_p=1.0),
+            processor.prefill(torch.tensor([11, 12, 13]), temperature=0.0, top_p=1.0),
+            processor.prefill(torch.tensor([21, 22]), temperature=0.0, top_p=1.0),
+            processor.prefill(torch.tensor([31]), temperature=0.0, top_p=1.0),
         )
         handles = [processor.handles[handle_id] for handle_id in handle_ids]
 
@@ -229,7 +231,7 @@ class ModelProcessorConcurrencyTests(unittest.IsolatedAsyncioTestCase):
             max_batch_generate=8,
         )
 
-        handle_id = await processor.prefill([11, 12], temperature=0.0, top_p=1.0)
+        handle_id = await processor.prefill(torch.tensor([11, 12]), temperature=0.0, top_p=1.0)
         handle = processor.handles[handle_id]
         await asyncio.sleep(0.1)
 
@@ -251,7 +253,7 @@ class ModelProcessorConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         )
 
         with self.assertRaises(RuntimeError):
-            await processor.prefill([11, 12, 13], temperature=0.0, top_p=1.0)
+            await processor.prefill(torch.tensor([11, 12, 13]), temperature=0.0, top_p=1.0)
 
     async def test_prefill_admission_follows_cache_occupancy(self):
         class OccupancyModel(FakeConcurrentModel):
@@ -277,8 +279,8 @@ class ModelProcessorConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         )
 
         await asyncio.gather(
-            processor.prefill([11, 12], temperature=0.0, top_p=1.0, max_new_tokens=2),
-            processor.prefill([21, 22], temperature=0.0, top_p=1.0, max_new_tokens=2),
+            processor.prefill(torch.tensor([11, 12]), temperature=0.0, top_p=1.0, max_new_tokens=2),
+            processor.prefill(torch.tensor([21, 22]), temperature=0.0, top_p=1.0, max_new_tokens=2),
         )
         await asyncio.sleep(0.1)
 
@@ -295,8 +297,8 @@ class ModelProcessorConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         )
 
         handle_ids = await asyncio.gather(
-            processor.prefill([11, 12, 13], temperature=0.0, top_p=1.0),
-            processor.prefill([21], temperature=0.0, top_p=1.0),
+            processor.prefill(torch.tensor([11, 12, 13]), temperature=0.0, top_p=1.0),
+            processor.prefill(torch.tensor([21]), temperature=0.0, top_p=1.0),
         )
         handle = processor.handles[handle_ids[0]]
         await asyncio.sleep(0.1)

@@ -12,7 +12,7 @@ import zmq
 import zmq.asyncio
 from torch.nn.utils.rnn import pad_sequence
 
-from models.model import ModelForwardState
+from models.model import ModelForwardState, PrefillState
 from sampling import top_k_top_p_sample
 from kvcache import blocks_for_tokens
 
@@ -25,6 +25,7 @@ class ServerHandle:
         self,
         handle_id: int,
         tokens: torch.Tensor,
+        prompt_tokens: list[int],
         temperature: float,
         top_p: float,
         max_new_tokens: int,
@@ -32,6 +33,7 @@ class ServerHandle:
     ):
         self.id = handle_id
         self.tokens = tokens
+        self.prompt_tokens = prompt_tokens
         self.temperature = temperature
         self.top_p = top_p
         self.top_k = top_k
@@ -138,7 +140,7 @@ async def run_model_server(endpoint: str, processor: "ModelProcessor"):
 
         if op == "PREFILL":
             result = await processor.prefill(
-                payload["tokens"],
+                torch.tensor(payload["tokens"], dtype=torch.long),
                 temperature=payload.get("temperature", 1.0),
                 top_p=payload.get("top_p", 1.0),
                 top_k=payload.get("top_k"),
@@ -216,16 +218,14 @@ class ModelProcessor:
 
     async def prefill(
         self,
-        tokens: list[int],
+        tokens: torch.Tensor,
         temperature: float = 1.0,
         top_p: float = 1.0,
         top_k: int | None = None,
         max_new_tokens: int | None = None,
     ):
-        if isinstance(tokens, torch.Tensor):
-            tokens_t = tokens.detach().clone().to(device=self.device, dtype=torch.long)
-        else:
-            tokens_t = torch.tensor(tokens, device=self.device, dtype=torch.long)
+        prompt_tokens = [int(tok) for tok in tokens.detach().cpu().tolist()]
+        tokens_t = tokens.to(device=self.device)
 
         prompt_len = int(tokens_t.size(0))
         if prompt_len > self.max_request_len:
@@ -242,6 +242,7 @@ class ModelProcessor:
             handle = ServerHandle(
                 handle_id,
                 tokens_t,
+                prompt_tokens,
                 temperature=temperature,
                 top_p=top_p,
                 top_k=top_k,
@@ -283,22 +284,25 @@ class ModelProcessor:
                 len(self.generating),
             )
             seqs = []
-            prefill_last_chunk = []
             handle_ids = []
+            prefill_state = []
             for handle in batch:
                 end = min(handle.prefill_pos + chunk_size, handle.tokens.size(0))
-                seqs.append(handle.tokens[handle.prefill_pos:end])
-                prefill_last_chunk.append(end == handle.tokens.size(0))
+                chunk_tokens = handle.tokens[handle.prefill_pos:end]
+                seqs.append(chunk_tokens)
                 handle_ids.append(handle.id)
+                prefill_state.append(
+                    PrefillState(
+                        offset=handle.prefill_pos,
+                        first_chunk=handle.prefill_pos == 0,
+                        last_chunk=end == handle.tokens.size(0),
+                        prompt_tokens=handle.prompt_tokens,
+                        length=torch.tensor(chunk_tokens.size(0), device=self.device),
+                    )
+                )
             lengths = torch.tensor([t.size(0) for t in seqs], device=self.device)
             input_ids = pad_sequence(
                 seqs,
-                batch_first=True,
-                padding_value=0,
-            )
-            prompt_lengths = torch.tensor([h.tokens.size(0) for h in batch], device=self.device)
-            prompt_tokens = pad_sequence(
-                [h.tokens for h in batch],
                 batch_first=True,
                 padding_value=0,
             )
@@ -306,14 +310,9 @@ class ModelProcessor:
             state = ModelForwardState(
                 tokens=input_ids,
                 prefill=True,
-                mask=mask,
-                lengths=lengths,
                 uuid=tuple(handle_ids),
-                prefill_offset=torch.tensor([h.prefill_pos for h in batch], device=self.device),
-                prefill_first_chunk=torch.tensor([h.prefill_pos == 0 for h in batch], device=self.device, dtype=torch.bool),
-                prefill_last_chunk=torch.tensor(prefill_last_chunk, device=self.device, dtype=torch.bool),
-                prompt_tokens=prompt_tokens,
-                prompt_lengths=prompt_lengths,
+                mask=mask,
+                prefill_state=prefill_state,
             )
             return input_ids, state
 
@@ -327,8 +326,6 @@ class ModelProcessor:
             state = ModelForwardState(
                 tokens=input_ids,
                 prefill=False,
-                mask=None,
-                lengths=None,
                 uuid=tuple(handle_ids),
             )
             return input_ids, state
@@ -370,11 +367,11 @@ class ModelProcessor:
                 input_ids, state = self._make_batch(batch, op)
                 model_out = self.model(input_ids, state)
                 if op == OP.PREFILL:
-                    final_rows = state.prefill_last_chunk
-                    result_batch = [handle for handle, is_final in zip(batch, final_rows.tolist()) if is_final]
+                    final_rows = [prefill.last_chunk for prefill in state.prefill_state]
+                    result_batch = [handle for handle, is_final in zip(batch, final_rows) if is_final]
                     results = []
-                    if final_rows.any():
-                        results = self._decode_batch(model_out, result_batch).tolist()
+                    if any(final_rows):
+                        results = self._decode_batch(model_out, result_batch) .tolist()
                 else:
                     result_batch = batch
                     results = self._decode_batch(model_out, result_batch).tolist()
@@ -385,8 +382,9 @@ class ModelProcessor:
                     self.in_flight.discard(handle.id)
                     released = handle.cancelled or handle.id not in self.handles
                     if op == OP.PREFILL:
-                        handle.prefill_pos += int(state.lengths[batch_idx].item())
-                        is_final_chunk = bool(state.prefill_last_chunk[batch_idx].item())
+                        prefill = state.prefill_state[batch_idx]
+                        handle.prefill_pos += int(prefill.length.item())
+                        is_final_chunk = prefill.last_chunk
                         if not is_final_chunk:
                             if not released:
                                 self.prefill_waiting.append(handle)
