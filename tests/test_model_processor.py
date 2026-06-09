@@ -93,7 +93,7 @@ class DecodeBatchTests(unittest.TestCase):
     def test_decode_batch_top_k_1_always_returns_argmax(self):
         logits = torch.tensor([[0.1, 0.9, 0.2]], dtype=torch.float32)
         batch = [
-            ServerHandle(0, torch.tensor([1]), temperature=1.0, top_p=1.0, top_k=1, max_new_tokens=1),
+            ServerHandle(0, torch.tensor([1]), [1], temperature=1.0, top_p=1.0, top_k=1, max_new_tokens=1),
         ]
 
         for _ in range(20):
@@ -104,7 +104,7 @@ class DecodeBatchTests(unittest.TestCase):
         # token 2 has real probability but is outside top-2
         logits = torch.tensor([[4.0, 3.0, 2.0]], dtype=torch.float32)
         batch = [
-            ServerHandle(0, torch.tensor([1]), temperature=2.0, top_p=1.0, top_k=2, max_new_tokens=1),
+            ServerHandle(0, torch.tensor([1]), [1], temperature=2.0, top_p=1.0, top_k=2, max_new_tokens=1),
         ]
 
         seen = set()
