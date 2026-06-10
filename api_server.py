@@ -25,15 +25,18 @@ class ChatCompletionRequest(BaseModel):
     max_tokens: int = 256
     temperature: float = 1.0
     top_p: float = 1.0
+    top_k: int | None = None
     stream: bool = False
     stop: str | list[str] | None = None
 
 
-def validate_sampling_params(temperature: float, top_p: float):
+def validate_sampling_params(temperature: float, top_p: float, top_k: int | None):
     if temperature < 0:
         raise HTTPException(status_code=400, detail="temperature must be >= 0")
     if not 0 < top_p <= 1:
         raise HTTPException(status_code=400, detail="top_p must be in (0, 1]")
+    if top_k is not None and top_k < 1:
+        raise HTTPException(status_code=400, detail="top_k must be >= 1")
 
 
 def parse_model(model_name: str) -> MODEL:
@@ -118,7 +121,7 @@ async def chat(req: ChatCompletionRequest):
         )
 
     prompt = build_prompt(req.messages)
-    validate_sampling_params(req.temperature, req.top_p)
+    validate_sampling_params(req.temperature, req.top_p, req.top_k)
     created = int(time.time())
     completion_id = f"chatcmpl-{uuid.uuid4().hex}"
     Logger.info("Chat completion request id=%s stream=%s max_tokens=%d", completion_id, req.stream, req.max_tokens)
@@ -130,7 +133,7 @@ async def chat(req: ChatCompletionRequest):
             prompt_tokens = 0
             completion_tokens = 0
 
-            async for ev in engine.generate_stream(prompt, req.max_tokens, temperature=req.temperature, top_p=req.top_p):
+            async for ev in engine.generate_stream(prompt, req.max_tokens, temperature=req.temperature, top_p=req.top_p, top_k=req.top_k):
                 match ev:
                     case GenStart():
                         prompt_tokens = ev.prompt_tokens
@@ -139,14 +142,14 @@ async def chat(req: ChatCompletionRequest):
                     case GenDelta():
                         yield f"data: {json.dumps(chunk_payload(completion_id, created, req.model, {'content': ev.text}))}\n\n"
             
-            yield f"data: {json.dumps(chunk_payload(completion_id, created, req.model, {}, 'stop') | {'usage': get_usage(prompt_tokens, completion_tokens)})}\n\n"
+            yield f"data: {json.dumps(chunk_payload(completion_id, created, req.model, {}, 'stop') | {"usage": get_usage(prompt_tokens, completion_tokens)})}\n\n"
             yield "data: [DONE]\n\n"
             
             Logger.info("Chat completion streamed id=%s", completion_id)
 
         return StreamingResponse(event_stream(), media_type="text/event-stream")
 
-    text, prompt_tokens, completion_tokens = await engine.generate(prompt, req.max_tokens, temperature=req.temperature, top_p=req.top_p)
+    text, prompt_tokens, completion_tokens = await engine.generate(prompt, req.max_tokens, temperature=req.temperature, top_p=req.top_p, top_k=req.top_k)
     Logger.info("Chat completion finished id=%s completion_tokens=%d", completion_id, completion_tokens)
     return {
         "id": completion_id,

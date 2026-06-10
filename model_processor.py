@@ -29,12 +29,14 @@ class ServerHandle:
         temperature: float,
         top_p: float,
         max_new_tokens: int,
+        top_k: int | None = None,
     ):
         self.id = handle_id
         self.tokens = tokens
         self.prompt_tokens = prompt_tokens
         self.temperature = temperature
         self.top_p = top_p
+        self.top_k = top_k
         self.cache_len = int(tokens.size(0))
         self.prefill_pos = 0
         self.max_new_tokens = max_new_tokens
@@ -96,6 +98,7 @@ class RemoteModelProcessorHandle:
         tokens: torch.Tensor,
         temperature: float = 1.0,
         top_p: float = 1.0,
+        top_k: int | None = None,
         max_new_tokens: int | None = None,
     ) -> RemoteHandle:
         resp = await self.call(
@@ -104,6 +107,7 @@ class RemoteModelProcessorHandle:
                 "tokens": tokens.tolist(),
                 "temperature": temperature,
                 "top_p": top_p,
+                "top_k": top_k,
                 "max_new_tokens": max_new_tokens,
             },
         )
@@ -139,6 +143,7 @@ async def run_model_server(endpoint: str, processor: "ModelProcessor"):
                 torch.tensor(payload["tokens"], dtype=torch.long),
                 temperature=payload.get("temperature", 1.0),
                 top_p=payload.get("top_p", 1.0),
+                top_k=payload.get("top_k"),
                 max_new_tokens=payload.get("max_new_tokens"),
             )
 
@@ -216,6 +221,7 @@ class ModelProcessor:
         tokens: torch.Tensor,
         temperature: float = 1.0,
         top_p: float = 1.0,
+        top_k: int | None = None,
         max_new_tokens: int | None = None,
     ):
         prompt_tokens = [int(tok) for tok in tokens.detach().cpu().tolist()]
@@ -228,7 +234,7 @@ class ModelProcessor:
             )
         allowed_new_tokens = self.max_request_len - prompt_len
         max_new_tokens = allowed_new_tokens if max_new_tokens is None else min(max_new_tokens, allowed_new_tokens)
-       
+
         with self.cv:
             handle_id = self.next_handle_id
             self.next_handle_id += 1
@@ -239,6 +245,7 @@ class ModelProcessor:
                 prompt_tokens,
                 temperature=temperature,
                 top_p=top_p,
+                top_k=top_k,
                 max_new_tokens=max_new_tokens,
             )
             self.handles[handle_id] = handle
@@ -416,7 +423,7 @@ class ModelProcessor:
             else:
                 token = top_k_top_p_sample(
                     logits[idx:idx + 1],
-                    top_k=None,
+                    top_k=handle.top_k,
                     top_p=handle.top_p,
                     temperature=handle.temperature,
                 ).squeeze(0)

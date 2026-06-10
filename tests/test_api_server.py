@@ -14,28 +14,36 @@ class FakeEngine:
         self.generate_calls = []
         self.generate_stream_calls = []
 
-    async def generate(self, prompt, max_tokens, temperature=1.0, top_p=1.0):
+    async def generate(self, prompt, max_tokens, temperature=1.0, top_p=1.0, top_k=None):
         self.generate_calls.append(
             {
                 "prompt": prompt,
                 "max_tokens": max_tokens,
                 "temperature": temperature,
                 "top_p": top_p,
+                "top_k": top_k,
             }
         )
-        return "ok"
+        return "ok", 5, 3
 
-    async def generate_stream(self, prompt, max_tokens, temperature=1.0, top_p=1.0):
+    async def generate_stream(self, prompt, max_tokens, temperature=1.0, top_p=1.0, top_k=None):
         self.generate_stream_calls.append(
             {
                 "prompt": prompt,
                 "max_tokens": max_tokens,
                 "temperature": temperature,
                 "top_p": top_p,
+                "top_k": top_k,
             }
         )
+        from engine import GenStart, GenDelta, GenEnd
+
+        yield GenStart(prompt_tokens=5)
+
         for chunk in ("o", "k"):
-            yield chunk
+            yield GenDelta(text=chunk)
+
+        yield GenEnd(completion_tokens=2)
 
 
 class ApiServerTests(unittest.IsolatedAsyncioTestCase):
@@ -73,6 +81,7 @@ class ApiServerTests(unittest.IsolatedAsyncioTestCase):
                     "max_tokens": 7,
                     "temperature": 0.4,
                     "top_p": 0.8,
+                    "top_k": None,
                 }
             ],
         )
@@ -103,9 +112,38 @@ class ApiServerTests(unittest.IsolatedAsyncioTestCase):
                     "max_tokens": 5,
                     "temperature": 0.9,
                     "top_p": 0.7,
+                    "top_k": None,
                 }
             ],
         )
+
+    async def test_chat_passes_top_k_to_generate(self):
+        req = ChatCompletionRequest(
+            model=MODEL.QWEN_2_5_0_5B_INSTRUCT.value,
+            messages=[ChatMessage(role="user", content="hello")],
+            max_tokens=5,
+            top_k=10,
+            stream=False,
+        )
+
+        await chat(req)
+
+        self.assertEqual(app.state.engine.generate_calls[0]["top_k"], 10)
+
+    async def test_chat_stream_passes_top_k_to_generate_stream(self):
+        req = ChatCompletionRequest(
+            model=MODEL.QWEN_2_5_0_5B_INSTRUCT.value,
+            messages=[ChatMessage(role="user", content="hello")],
+            max_tokens=5,
+            top_k=20,
+            stream=True,
+        )
+
+        response = await chat(req)
+        async for _ in response.body_iterator:
+            pass
+
+        self.assertEqual(app.state.engine.generate_stream_calls[0]["top_k"], 20)
 
     async def test_chat_rejects_invalid_sampling_params(self):
         req = ChatCompletionRequest(
@@ -124,12 +162,31 @@ class ApiServerTests(unittest.IsolatedAsyncioTestCase):
 
 class ValidateSamplingParamsTests(unittest.TestCase):
     def test_accepts_openai_style_values(self):
-        validate_sampling_params(0.0, 1.0)
-        validate_sampling_params(1.0, 0.5)
+        validate_sampling_params(0.0, 1.0, None)
+        validate_sampling_params(1.0, 0.5, None)
 
     def test_rejects_invalid_top_p(self):
         with self.assertRaises(HTTPException):
-            validate_sampling_params(1.0, 0.0)
+            validate_sampling_params(1.0, 0.0, None)
 
         with self.assertRaises(HTTPException):
-            validate_sampling_params(1.0, 1.1)
+            validate_sampling_params(1.0, 1.1, None)
+
+    def test_accepts_valid_top_k(self):
+        validate_sampling_params(1.0, 1.0, 1)
+        validate_sampling_params(1.0, 1.0, 50)
+
+    def test_accepts_none_top_k(self):
+        validate_sampling_params(1.0, 1.0, None)
+
+    def test_rejects_top_k_zero(self):
+        with self.assertRaises(HTTPException) as ctx:
+            validate_sampling_params(1.0, 1.0, 0)
+        self.assertEqual(ctx.exception.status_code, 400)
+        self.assertIn("top_k", ctx.exception.detail)
+
+    def test_rejects_negative_top_k(self):
+        with self.assertRaises(HTTPException) as ctx:
+            validate_sampling_params(1.0, 1.0, -1)
+        self.assertEqual(ctx.exception.status_code, 400)
+        self.assertIn("top_k", ctx.exception.detail)

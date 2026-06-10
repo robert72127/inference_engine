@@ -123,7 +123,7 @@ class Engine:
         self.next_worker = (self.next_worker + 1) % self.model_workers_cnt
         return worker
 
-    async def _setup_generation(self, message, max_tokens, temperature, top_p):
+    async def _setup_generation(self, message, max_tokens, temperature, top_p, top_k):
         prompt = self.apply_prompt_template(message)
         tokenized = await self.tokenizer.tokenize([prompt])
         tokens = tokenized["input_ids"][0]
@@ -131,11 +131,11 @@ class Engine:
 
         backend = self.schedule()
         Logger.debug("Scheduled request prompt_tokens=%d max_tokens=%d", prompt_tokens, max_tokens)
-        handle = await backend.prefill(tokens, temperature=temperature, top_p=top_p, max_new_tokens=max_tokens)
+        handle = await backend.prefill(tokens, temperature=temperature, top_p=top_p, top_k=top_k, max_new_tokens=max_tokens)
         return backend, handle, prompt_tokens
 
-    async def generate_stream(self, message, max_tokens, temperature=1.0, top_p=1.0):
-        backend, handle, prompt_tokens = await self._setup_generation(message, max_tokens, temperature, top_p)
+    async def generate_stream(self, message, max_tokens, temperature=1.0, top_p=1.0, top_k=None):
+        backend, handle, prompt_tokens = await self._setup_generation(message, max_tokens, temperature, top_p, top_k)
 
         yield GenStart(prompt_tokens=prompt_tokens)
 
@@ -153,12 +153,12 @@ class Engine:
 
         await backend.release(handle)
 
-    async def generate(self, message, max_tokens, temperature=1.0, top_p=1.0) -> tuple[str, int, int]:
+    async def generate(self, message, max_tokens, temperature=1.0, top_p=1.0, top_k=None) -> tuple[str, int, int]:
         parts: list[str] = []
         prompt_tokens = 0
         completion_tokens = 0
 
-        async for ev in self.generate_stream(message, max_tokens, temperature=temperature, top_p=top_p):
+        async for ev in self.generate_stream(message, max_tokens, temperature=temperature, top_p=top_p, top_k=top_k):
             match ev:
                 case GenStart():
                     prompt_tokens = ev.prompt_tokens

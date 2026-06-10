@@ -90,6 +90,31 @@ class DecodeBatchTests(unittest.TestCase):
         self.assertEqual(tuple(out.shape), (2,))
         self.assertTrue(out.dtype == torch.long)
 
+    def test_decode_batch_top_k_1_always_returns_argmax(self):
+        logits = torch.tensor([[0.1, 0.9, 0.2]], dtype=torch.float32)
+        batch = [
+            ServerHandle(0, torch.tensor([1]), [1], temperature=1.0, top_p=1.0, top_k=1, max_new_tokens=1),
+        ]
+
+        for _ in range(20):
+            out = self.processor._decode_batch(logits, batch)
+            self.assertEqual(out[0].item(), 1)
+
+    def test_decode_batch_top_k_restricts_candidates(self):
+        # token 2 has real probability but is outside top-2
+        logits = torch.tensor([[4.0, 3.0, 2.0]], dtype=torch.float32)
+        batch = [
+            ServerHandle(0, torch.tensor([1]), [1], temperature=2.0, top_p=1.0, top_k=2, max_new_tokens=1),
+        ]
+
+        seen = set()
+        torch.manual_seed(0)
+        for _ in range(100):
+            out = self.processor._decode_batch(logits, batch)
+            seen.add(out[0].item())
+
+        self.assertTrue(seen.issubset({0, 1}))
+
     def test_decode_batch_supports_mixed_sampling_params(self):
         torch.manual_seed(0)
         logits = torch.tensor(
