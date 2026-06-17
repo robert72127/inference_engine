@@ -79,7 +79,7 @@ async def lifespan(app: FastAPI):
     max_cache_seq_len = int(os.getenv("MODEL_MAX_CACHE_SEQ_LEN", "4096"))
     cpu_reserve_gb = float(os.getenv("MODEL_CPU_RESERVE_GB", "6"))
     cuda_memory_fraction = float(os.getenv("MODEL_CUDA_MEMORY_FRACTION", "1.0"))
-    prefill_chunk_size = os.getenv("MODEL_PREFILL_CHUNK_SIZE")
+    prefill_chunk_size = os.getenv("MODEL_PREFILL_CHUNK_SIZE", 64)
     app.state.engine = Engine(
         model=model,
         backend=backend,

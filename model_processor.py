@@ -159,19 +159,6 @@ def start_model_process(endpoint: str, model_constructor, device, eos_token_id: 
     )
     asyncio.run(run_model_server(endpoint, processor))
 
-class PrefillChunkSizer:
-    def __init__(self, default_chunk_size: int):
-        self.default_chunk_size = default_chunk_size
-
-    def get_chunk_size(self, batch: list["ServerHandle"], generating_cnt: int):
-        remaining_tokens = [handle.tokens.size(0) - handle.prefill_pos for handle in batch]
-        if generating_cnt == 0:
-            if len(batch) == 1:
-                return remaining_tokens[0]
-            if max(remaining_tokens) - min(remaining_tokens) <= self.default_chunk_size:
-                return max(remaining_tokens)
-        return self.default_chunk_size
-
 class ModelProcessor:
     def __init__(
         self,
@@ -179,9 +166,8 @@ class ModelProcessor:
         device: torch.device,
         eos_token_id: int,
         max_request_len: int,
-        max_batch_prefill: int = 8,
-        max_batch_generate: int = 8,
-        prefill_chunk_size: int | None = None,
+        max_batch_size: int = 8,
+        prefill_chunk_size: int = 64,
     ):
         self.device = torch.device(device)
         self.model = model_constructor(self.device)
@@ -189,11 +175,9 @@ class ModelProcessor:
         self.max_request_len = max_request_len
         self.eos_token_id = eos_token_id
 
-        self.max_batch_prefill = max_batch_prefill
-        self.max_batch_generate = max_batch_generate
-        if prefill_chunk_size is None:
-            prefill_chunk_size = self.kv_caches[0].block_size
-        self.prefill_chunk_sizer = PrefillChunkSizer(prefill_chunk_size)
+        self.supported_batch_sizes = [2**i for i in range(max_batch_size.bit_length()) if 2**i <= max_batch_size]
+
+        self.prefill_chunk_size = prefill_chunk_size
 
         self.lock = threading.Lock()
         self.cv = threading.Condition(self.lock)
@@ -272,15 +256,11 @@ class ModelProcessor:
 
     def _make_batch(self, batch: list[ServerHandle], op: OP):
         if op == OP.PREFILL:
-            chunk_size = self.prefill_chunk_sizer.get_chunk_size(
-                batch,
-                len(self.generating),
-            )
             seqs = []
             handle_ids = []
             prefill_state = []
             for handle in batch:
-                end = min(handle.prefill_pos + chunk_size, handle.tokens.size(0))
+                end = min(handle.prefill_pos + self.prefill_chunk_size, handle.tokens.size(0))
                 chunk_tokens = handle.tokens[handle.prefill_pos:end]
                 seqs.append(chunk_tokens)
                 handle_ids.append(handle.id)
@@ -338,16 +318,16 @@ class ModelProcessor:
                         next_op = OP.GENERATE
                         continue
                     op = OP.PREFILL
-                    batch_size = min(self.max_batch_prefill, available_slots)
+                    batch_size =  self._get_batch_size( min(available_slots, len(self.prefill_waiting)))
                     batch = self.prefill_waiting[:batch_size]
                     self.prefill_waiting = self.prefill_waiting[batch_size:]
                 else:
-                    max_batch_size = self._get_max_generate_batch_size()
-                    if max_batch_size == 0:
+                    batch_size = self._get_batch_size(len(self.generating))
+                    if batch_size == 0:
                         next_op = OP.PREFILL
                         continue
                     op = OP.GENERATE
-                    batch = self.generating[:max_batch_size]
+                    batch = self.generating[:batch_size]
 
             with self.cv:
                 batch = [handle for handle in batch if handle.id in self.handles]
@@ -427,8 +407,11 @@ class ModelProcessor:
         max_blocks_per_request = blocks_for_tokens(self.max_request_len, self.kv_caches[0].block_size)
         return max(0, self.kv_caches[0].get_blocks_available() // max_blocks_per_request)
 
-    def _get_max_generate_batch_size(self):
-        return min(self.max_batch_generate, len(self.generating))
+    def _get_batch_size(self, reqs_len):
+        if reqs_len == 0: return 0
+        for b_size in self.supported_batch_sizes:
+            if b_size > reqs_len: return b_size -1
+        return self.supported_batch_sizes[-1]
 
     def _release_caches(self, handle_id: int):
         for cache in self.kv_caches:
