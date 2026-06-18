@@ -270,8 +270,6 @@ class Qwen2_5_0_5B_Instruct(Model):
   
     @torch.inference_mode()
     def __call__(self, input: torch.Tensor, state: ModelForwardState) -> torch.Tensor:
-        tokens = state.tokens.to(self.device)
-        mask = None if state.mask is None else state.mask.to(self.device)
         out = input.to(self.device)
         for layer in self.layers: 
             layer, is_transformer = layer
@@ -293,6 +291,11 @@ class Qwen2_5_0_5B_Instruct(Model):
 
     def get_model_dir(self):
         return self.model_dir
+
+    def KV_init(self, handle_id, prompt_tokens):
+        for kv_cache in self.kv_caches:
+            kv_cache.init(handle_id, prompt_tokens)
+    
 
 if __name__ == '__main__':
     pages = os.sysconf("SC_PHYS_PAGES")

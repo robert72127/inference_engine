@@ -228,16 +228,18 @@ class ModelProcessor:
             self.handles[handle_id] = handle
             self.prefill_waiting.append(handle)
 
+            # calls KV_CACHE.init Init_uuid, prompt_tokens for each cache in model
+            self.model.KV_init(handle_id, prompt_tokens)
+
             self.cv.notify()
 
         return handle_id
 
-    async def next_token(self, handle_id: int):
+    async def decode(self, handle_id: int):
         with self.lock:
             handle = self.handles.get(handle_id)
         if handle is None:
             return self.eos_token_id
-
         loop = asyncio.get_running_loop()
         tok = await loop.run_in_executor(None,handle.token_q.get,)
         return tok
@@ -267,7 +269,6 @@ class ModelProcessor:
                 prefill_state.append(
                     PrefillState(
                         offset=handle.prefill_pos,
-                        first_chunk=handle.prefill_pos == 0,
                         last_chunk=end == handle.tokens.size(0),
                         prompt_tokens=handle.prompt_tokens,
                         length=torch.tensor(chunk_tokens.size(0), device=self.device),

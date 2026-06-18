@@ -275,16 +275,15 @@ class RadixKVCache:
         return torch.tensor(positions, device=self.K.device).unsqueeze(1)
 
     # first step in prefill, serach for pages matching longest prefix of toks
-    def init(self, uuids, toks):
-        for i, uuid in enumerate(uuids):
-            blocks, blocks_cnt = self.radix_search(uuid, self._block_keys_for_tokens(toks[i]))
-            self.uuids[uuid] = self.UUIDState(
+    def init(self, uuid, toks):
+        blocks, blocks_cnt = self.radix_search(uuid, self._block_keys_for_tokens(toks))
+        self.uuids[uuid] = self.UUIDState(
                 uuid,
                 self,
                 self.block_size,
                 blocks_count=blocks_cnt,
                 commited_blocks=blocks,
-            )
+        )
 
     def prefill(self, uuids, toks, K, V, mask):
         for i, uuid in enumerate(uuids):

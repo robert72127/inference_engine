@@ -6,7 +6,6 @@ import torch
 @dataclass(frozen=True)
 class PrefillState:
     offset: int
-    first_chunk: bool
     last_chunk: bool
     prompt_tokens: list[int]
     length: torch.Tensor | None = None
@@ -31,4 +30,9 @@ class Model(ABC):
 
     @abstractmethod
     def get_model_dir(self):
+        pass
+
+
+    @abstractmethod
+    def KV_init(self, handle_id, prompt_tokens):
         pass

@@ -141,7 +141,7 @@ class Engine:
 
         completion_tokens = 0
         for _ in range(max_tokens):
-            tok = await backend.next_token(handle)
+            tok = await backend.decode(handle)
             if tok == self.tokenizer.tokenizer.eos_token_id:
                 break
 

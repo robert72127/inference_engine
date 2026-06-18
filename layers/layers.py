@@ -129,16 +129,6 @@ class MultiQueryAttention:
         batch_size = x.size(0)
 
         # first call init for any uuids that have the first chunk in this batch
-        init_uuid = []
-        init_tokens = []
-        for bidx in range(batch_size):
-            prefill = state.prefill_state[bidx]
-            if prefill.first_chunk:
-                init_uuid.append(state.uuid[bidx])
-                init_tokens.append(prefill.prompt_tokens)
-        if init_uuid:
-            self.KV_cache.init(tuple(init_uuid), init_tokens)
-
         out = torch.zeros_like(x)
         for bidx in range(batch_size):
             prefill = state.prefill_state[bidx]
