@@ -283,7 +283,6 @@ class ModelProcessor:
             mask = torch.arange(input_ids.size(1), device=self.device)[None, :] < lengths[:, None]
             state = ModelForwardState(
                 tokens=input_ids,
-                prefill=True,
                 uuid=tuple(handle_ids),
                 mask=mask,
                 prefill_state=prefill_state,
@@ -299,7 +298,6 @@ class ModelProcessor:
             ).unsqueeze(1)
             state = ModelForwardState(
                 tokens=input_ids,
-                prefill=False,
                 uuid=tuple(handle_ids),
             )
             return input_ids, state
@@ -339,14 +337,15 @@ class ModelProcessor:
 
             with torch.inference_mode():
                 input_ids, state = self._make_batch(batch, op)
-                model_out = self.model(input_ids, state)
                 if op == OP.PREFILL:
+                    model_out = self.model.prefill(input_ids, state, batch_size)
                     final_rows = [prefill.last_chunk for prefill in state.prefill_state]
                     result_batch = [handle for handle, is_final in zip(batch, final_rows) if is_final]
                     results = []
                     if any(final_rows):
                         results = self._decode_batch(model_out, result_batch) .tolist()
                 else:
+                    model_out = self.model.decode(input_ids, state, batch_size)
                     result_batch = batch
                     results = self._decode_batch(model_out, result_batch).tolist()
 

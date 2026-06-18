@@ -120,12 +120,7 @@ class MultiQueryAttention:
         self.k_bias = None if k_bias is None else k_bias
         self.v_bias = None if v_bias is None else v_bias
 
-    def __call__(self, x:torch.Tensor, state: ModelForwardState):
-        if state.prefill:
-            return self._prefill(x, state)
-        return self._generate(x, state)
-
-    def _prefill(self, x:torch.Tensor, state: ModelForwardState):
+    def prefill(self, x:torch.Tensor, state: ModelForwardState):
         batch_size = x.size(0)
 
         # first call init for any uuids that have the first chunk in this batch
@@ -217,10 +212,11 @@ class MultiQueryAttention:
             vh[:, tokens_seen:tokens_seen + valid_tokens, :] = v_block[:, :valid_tokens, :]
             tokens_seen += valid_tokens
 
-    def _generate(self, x:torch.Tensor, state: ModelForwardState):
+    def decode(self, x:torch.Tensor, state: ModelForwardState):
         tokens = state.tokens
         uuid = state.uuid
-        
+        # x, tokens, uuid are all of shape batch X ...
+    #def _generate(self, x:torch.Tensor, tokens:torch.Tensor, uuid:torch.Tensor):
         Q = self.q_weights(x)
         K = self.k_weights(x)
         V = self.v_weights(x)
@@ -311,7 +307,14 @@ class TransformerBlock:
         self.attention = attention
         self.residual_rms = residual_rms
 
-    def __call__(self, x:torch.Tensor, state: ModelForwardState):
+    def decode(self, x:torch.Tensor, state:ModelForwardState):
         attn_in = self.pre_norm(x)
-        x, mlp_in =  self.residual_rms(x, self.attention(attn_in, state))
-        return  x + self.mlp(mlp_in)
+        x, mlp_in = self.residual_rms(x, self.attention.decode(attn_in, state))
+        return x + self.mlp(mlp_in)
+
+    def prefill(self, x:torch.Tensor, state:ModelForwardState):
+        attn_in = self.pre_norm(x)
+        x, mlp_in = self.residual_rms(x, self.attention.prefill(attn_in, state))
+        return x + self.mlp(mlp_in)
+
+

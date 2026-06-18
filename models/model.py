@@ -13,7 +13,6 @@ class PrefillState:
 @dataclass(frozen=True)
 class ModelForwardState:
     tokens: torch.Tensor
-    prefill: bool
     uuid: tuple[int, ...]
     mask: torch.Tensor | None = None
     prefill_state : list[PrefillState] | None = None
@@ -25,7 +24,11 @@ class Model(ABC):
         pass
 
     @abstractmethod
-    def __call__(self, input: torch.Tensor, state: ModelForwardState) -> torch.Tensor:
+    def prefill(self,input:torch.Tensor, state:ModelForwardState, batch_size:int):
+        pass
+
+    @abstractmethod
+    def decode(self,input:torch.Tensor, state:ModelForwardState, batch_size:int):
         pass
 
     @abstractmethod
