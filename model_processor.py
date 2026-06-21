@@ -12,7 +12,7 @@ import zmq
 import zmq.asyncio
 from torch.nn.utils.rnn import pad_sequence
 
-from models.model import ModelForwardState, PrefillState
+from models.model import PrefillState
 from sampling import top_k_top_p_sample
 from kvcache import blocks_for_tokens
 
@@ -25,20 +25,18 @@ class ServerHandle:
         self,
         handle_id: int,
         tokens: torch.Tensor,
-        prompt_tokens: list[int],
         temperature: float,
         top_p: float,
         max_new_tokens: int,
     ):
         self.id = handle_id
         self.tokens = tokens
-        self.prompt_tokens = prompt_tokens
         self.temperature = temperature
         self.top_p = top_p
         self.cache_len = int(tokens.size(0))
-        self.prefill_pos = 0
         self.max_new_tokens = max_new_tokens
         self.generated_tokens = 0
+        self.prefill_pos = 0
 
         #  previous token for generation.
         self.input_token: int | None = None
@@ -220,7 +218,6 @@ class ModelProcessor:
             handle = ServerHandle(
                 handle_id,
                 tokens_t,
-                prompt_tokens,
                 temperature=temperature,
                 top_p=top_p,
                 max_new_tokens=max_new_tokens,
@@ -270,7 +267,6 @@ class ModelProcessor:
                     PrefillState(
                         offset=handle.prefill_pos,
                         last_chunk=end == handle.tokens.size(0),
-                        prompt_tokens=handle.prompt_tokens,
                         length=torch.tensor(chunk_tokens.size(0), device=self.device),
                     )
                 )
@@ -281,13 +277,8 @@ class ModelProcessor:
                 padding_value=0,
             )
             mask = torch.arange(input_ids.size(1), device=self.device)[None, :] < lengths[:, None]
-            state = ModelForwardState(
-                tokens=input_ids,
-                uuid=tuple(handle_ids),
-                mask=mask,
-                prefill_state=prefill_state,
-            )
-            return input_ids, state
+            
+            return input_ids, handle_ids, mask, prefill_state
 
         else:
             handle_ids = [h.id for h in batch]
@@ -326,25 +317,26 @@ class ModelProcessor:
 
             with torch.inference_mode():
                 if op == OP.PREFILL:
-                    input_ids, state = self._make_batch(batch, op)
-                    model_out = self.model.prefill(input_ids, state, batch_size)
-                    final_rows = [prefill.last_chunk for prefill in state.prefill_state]
+ 
+                    input_ids, handle_ids, mask, prefill_state = self._make_batch(batch, op)
+                    model_out = self.model.prefill(input_ids, handle_ids, batch_size, mask, prefill_state)
+                    final_rows = [prefill.last_chunk for prefill in prefill_state]
                     result_batch = [handle for handle, is_final in zip(batch, final_rows) if is_final]
                     results = []
                     if any(final_rows):
                         results = self._decode_batch(model_out, result_batch) .tolist()
                 else:
                     input_ids, handle_ids = self._make_batch(batch, op)
-                    model_out = self.model.decode(input_ids, handle_ids, input_ids, batch_size)
+                    model_out = self.model.decode(input_ids, handle_ids, batch_size)
                     results = self._decode_batch(model_out, batch).tolist()
 
             with self.cv:
                 result_idx = 0
                 for batch_idx, handle in enumerate(batch):
                     self.in_flight.discard(handle.id)
-                    released = handle.cancelled or handle.id not in self.handles
+                    released =  handle.id not in self.handles
                     if op == OP.PREFILL:
-                        prefill = state.prefill_state[batch_idx]
+                        prefill = prefill_state[batch_idx]
                         handle.prefill_pos += int(prefill.length.item())
                         if not prefill.last_chunk and not released:
                             self.prefill_waiting.append(handle)

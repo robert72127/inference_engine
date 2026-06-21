@@ -7,28 +7,18 @@ import torch
 class PrefillState:
     offset: int
     last_chunk: bool
-    prompt_tokens: list[int]
-    length: int
-
-@dataclass(frozen=True)
-class ModelForwardState:
-    tokens: torch.Tensor
-    uuid: tuple[int, ...]
-    mask: torch.Tensor | None = None
-    prefill_state : list[PrefillState] | None = None
-
-
+    length: torch.Tensor
 
 class Model(ABC):
     def __init__(self, device: torch.device):
         pass
 
     @abstractmethod
-    def prefill(self,input:torch.Tensor, state:ModelForwardState, batch_size:int):
+    def prefill(self,tokens:torch.Tensor, uuid:list[int], batch_size:int, mask:torch.Tensor, state:list[PrefillState]):
         pass
 
     @abstractmethod
-    def decode(self,input:torch.Tensor, uuid:list[int], tokens:torch.Tensor, batch_size:int):
+    def decode(self,tokens:torch.Tensor, uuid:list[int], batch_size:int):
         pass
 
     @abstractmethod

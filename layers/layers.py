@@ -5,7 +5,7 @@ import math
 
 from kvcache import RadixKVCache
 from layers.triton_kernels import paged_mqa_decode, residual_rms
-from models.model import ModelForwardState
+from models.model import PrefillState
 
 class Embedding:
     def __init__(self, weights:torch.Tensor):
@@ -120,14 +120,14 @@ class MultiQueryAttention:
         self.k_bias = None if k_bias is None else k_bias
         self.v_bias = None if v_bias is None else v_bias
 
-    def prefill(self, x:torch.Tensor, state: ModelForwardState):
+    def prefill(self, x:torch.Tensor, uuid:list[int], tokens:torch.Tensor, batch_size:int, mask:torch.Tensor, state:list[PrefillState]):
         batch_size = x.size(0)
 
         # first call init for any uuids that have the first chunk in this batch
         out = torch.zeros_like(x)
         for bidx in range(batch_size):
-            prefill = state.prefill_state[bidx]
-            uuid = state.uuid[bidx]
+            prefill = state[bidx]
+            request_uuid = uuid[bidx]
             chunk_len = int(prefill.length.item())
 
             chunk_start = prefill.offset
@@ -135,7 +135,7 @@ class MultiQueryAttention:
             row = x[bidx:bidx + 1, :chunk_len, :]
 
             pages_info, cached_chunk_tokens = self.KV_cache.get_prefill_chunk_info(
-                uuid,
+                request_uuid,
                 chunk_start,
                 chunk_len,
             )
@@ -177,11 +177,11 @@ class MultiQueryAttention:
                 vh[:, chunk_start + cached_chunk_tokens:chunk_end, :] = v_suffix[0]
                 write_len = chunk_len - cached_chunk_tokens
                 self.KV_cache.prefill(
-                    (uuid,),
-                    state.tokens[bidx:bidx + 1, cached_chunk_tokens:chunk_len],
+                    (request_uuid,),
+                    tokens[bidx:bidx + 1, cached_chunk_tokens:chunk_len],
                     k_suffix,
                     v_suffix,
-                    torch.ones((1, write_len), device=state.tokens.device, dtype=torch.bool),
+                    torch.ones((1, write_len), device=tokens.device, dtype=torch.bool),
                 )
 
             group = self.num_attn_heads // self.num_kv_heads
@@ -211,7 +211,7 @@ class MultiQueryAttention:
             vh[:, tokens_seen:tokens_seen + valid_tokens, :] = v_block[:, :valid_tokens, :]
             tokens_seen += valid_tokens
 
-    def decode(self, x:torch.Tensor, uuid:list[int], tokens:torch.tensor):
+    def decode(self, x:torch.Tensor, uuid:list[int], tokens:torch.tensor, batch_size:int):
         Q = self.q_weights(x)
         K = self.k_weights(x)
         V = self.v_weights(x)
@@ -246,7 +246,7 @@ class MultiQueryAttention:
                 q=Qh, K_cache=self.KV_cache.K, V_cache=self.KV_cache.V, out=out,
                 page_indexes = padded_indexes,
                 page_index_stride = padded_indexes.stride(0),
-                batch_size = len(uuid),
+                batch_size = batch_size,
                 tok_cnt= torch.tensor([page["token_count"] for page in pages_info], device=Q.device),
                 seq_len_per_page=seq_len_per_page,
                 d_head=self.head_dim,
@@ -302,14 +302,14 @@ class TransformerBlock:
         self.attention = attention
         self.residual_rms = residual_rms
 
-    def decode(self, x:torch.Tensor, uuid:list[int], tokens:torch.tensor):
+    def decode(self, x:torch.Tensor, uuid:list[int], tokens:torch.tensor, batch_size:int):
         attn_in = self.pre_norm(x)
-        x, mlp_in = self.residual_rms(x, self.attention.decode(attn_in, uuid, tokens))
+        x, mlp_in = self.residual_rms(x, self.attention.decode(attn_in, uuid, tokens, batch_size))
         return x + self.mlp(mlp_in)
 
-    def prefill(self, x:torch.Tensor, state:ModelForwardState):
+    def prefill(self, x:torch.Tensor, uuid:list[int], tokens:torch.Tensor, batch_size:int, mask:torch.Tensor, state:list[PrefillState]):
         attn_in = self.pre_norm(x)
-        x, mlp_in = self.residual_rms(x, self.attention.prefill(attn_in, state))
+        x, mlp_in = self.residual_rms(x, self.attention.prefill(attn_in, uuid, tokens, batch_size, mask, state))
         return x + self.mlp(mlp_in)
 
 
