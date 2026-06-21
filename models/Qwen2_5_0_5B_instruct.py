@@ -5,7 +5,7 @@ import json
 import os
 from pathlib import Path
 
-from models.model import Model,PrefillState 
+from models.model import Model, PrefillStateBuff, DecodeStateBuff 
 from kvcache import blocks_for_tokens
 from layers.layers import (
     Embedding,
@@ -268,23 +268,21 @@ class Qwen2_5_0_5B_Instruct(Model):
             cache_max_seq_len=cache_max_seq_len,
             memory_available=memory_available,
         )
-
-    def prefill(self,tokens:torch.Tensor, uuids:list[int], batch_size:int, mask:torch.Tensor, state:list[PrefillState]):
-        out = self.input_embed(tokens.to(self.device))
+    
+    def prefill(self, state_buff:PrefillStateBuff):
+        out = self.input_embed(input.tokens)
         for transformer_layer in self.transformer_blocks: 
-            out = transformer_layer.prefill(out, uuids, tokens, batch_size, mask, state)
-        out = torch.stack([
-                    out[idx, int(prefill.length.item()) - 1]
-                    for idx, prefill in enumerate(state)])
-        out = out[[prefill.last_chunk for prefill in state]]        
+            out = transformer_layer.prefill(out, state_buff)
+        batch_idx = torch.arange(out.size(0), device=out.device)
+        out = out[batch_idx, input.seq_lens]
         for layer in self.output_layers:
             out = layer(out)
         return out
 
-    def decode(self,tokens:torch.Tensor, uuids:list[int], batch_size:int):
-        out = self.input_embed(tokens.to(self.device))
+    def decode(self, state_buff:DecodeStateBuff):
+        out = self.input_embed(input.tokens.to(self.device))
         for transformer_layer in self.transformer_blocks:
-            out = transformer_layer.decode(out, uuids, tokens, batch_size)        
+            out = transformer_layer.decode(out, state_buff)        
         out = out[:, -1, :]
         for layer in self.output_layers:
             out = layer(out)

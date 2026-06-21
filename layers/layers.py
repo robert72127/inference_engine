@@ -5,7 +5,7 @@ import math
 
 from kvcache import RadixKVCache
 from layers.triton_kernels import paged_mqa_decode, residual_rms
-from models.model import PrefillState
+from models.model import PrefillInput, DecodeInput
 
 class Embedding:
     def __init__(self, weights:torch.Tensor):
@@ -120,7 +120,7 @@ class MultiQueryAttention:
         self.k_bias = None if k_bias is None else k_bias
         self.v_bias = None if v_bias is None else v_bias
 
-    def prefill(self, x:torch.Tensor, uuid:list[int], tokens:torch.Tensor, batch_size:int, mask:torch.Tensor, state:list[PrefillState]):
+    def prefill(self, x, input_meta:PrefillInput):
         batch_size = x.size(0)
 
         # first call init for any uuids that have the first chunk in this batch
@@ -211,7 +211,10 @@ class MultiQueryAttention:
             vh[:, tokens_seen:tokens_seen + valid_tokens, :] = v_block[:, :valid_tokens, :]
             tokens_seen += valid_tokens
 
-    def decode(self, x:torch.Tensor, uuid:list[int], tokens:torch.tensor, batch_size:int):
+    def decode(self, x:torch.Tensor, input_meta:DecodeInput):
+        uuid = input_meta.uuid
+        tokens = input_meta.tokens       
+        batch_size = x.shape[0]
         Q = self.q_weights(x)
         K = self.k_weights(x)
         V = self.v_weights(x)
@@ -302,14 +305,14 @@ class TransformerBlock:
         self.attention = attention
         self.residual_rms = residual_rms
 
-    def decode(self, x:torch.Tensor, uuid:list[int], tokens:torch.tensor, batch_size:int):
+    def decode(self, x:torch.Tensor, input_meta:DecodeInput):
         attn_in = self.pre_norm(x)
-        x, mlp_in = self.residual_rms(x, self.attention.decode(attn_in, uuid, tokens, batch_size))
+        x, mlp_in = self.residual_rms(x, self.attention.decode(attn_in, input_meta))
         return x + self.mlp(mlp_in)
 
-    def prefill(self, x:torch.Tensor, uuid:list[int], tokens:torch.Tensor, batch_size:int, mask:torch.Tensor, state:list[PrefillState]):
+    def prefill(self, x, input_meta:PrefillInput):
         attn_in = self.pre_norm(x)
-        x, mlp_in = self.residual_rms(x, self.attention.prefill(attn_in, uuid, tokens, batch_size, mask, state))
+        x, mlp_in = self.residual_rms(x, self.attention.prefill(attn_in, input_meta))
         return x + self.mlp(mlp_in)
 
 

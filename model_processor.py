@@ -12,7 +12,7 @@ import zmq
 import zmq.asyncio
 from torch.nn.utils.rnn import pad_sequence
 
-from models.model import PrefillState
+from models.model import PrefillStateBuff, DecodeStateBuff
 from sampling import top_k_top_p_sample
 from kvcache import blocks_for_tokens
 
@@ -174,8 +174,16 @@ class ModelProcessor:
         self.eos_token_id = eos_token_id
 
         self.supported_batch_sizes = [2**i for i in range(max_batch_size.bit_length()) if 2**i <= max_batch_size]
-
         self.prefill_chunk_size = prefill_chunk_size
+
+        #prepare buffers for supported batch sizes
+        self.prefill_buffs = {batch_size : 
+                        PrefillStateBuff(
+                            batch_size=batch_size,
+                            chunk_size=self.prefill_chunk_size,
+                            device=self.device) for batch_size in self.supported_batch_sizes}
+        self.decode_buffs = {batch_size: DecodeStateBuff(batch_size=batch_size, device=self.device) for batch_size in self.supported_batch_sizes}
+
 
         self.lock = threading.Lock()
         self.cv = threading.Condition(self.lock)
@@ -253,41 +261,32 @@ class ModelProcessor:
                     self._release_caches(handle.id)
             self.cv.notify()
 
-    def _make_batch(self, batch: list[ServerHandle], op: OP):
+    def _make_batch(self, batch: list[ServerHandle], op: OP, batch_size:int):
         if op == OP.PREFILL:
-            seqs = []
-            handle_ids = []
-            prefill_state = []
-            for handle in batch:
+            buf = self.prefill_buffs[batch_size]
+
+            last_chunk = []
+            for i, handle in enumerate(batch):
                 end = min(handle.prefill_pos + self.prefill_chunk_size, handle.tokens.size(0))
-                chunk_tokens = handle.tokens[handle.prefill_pos:end]
-                seqs.append(chunk_tokens)
-                handle_ids.append(handle.id)
-                prefill_state.append(
-                    PrefillState(
-                        offset=handle.prefill_pos,
-                        last_chunk=end == handle.tokens.size(0),
-                        length=torch.tensor(chunk_tokens.size(0), device=self.device),
-                    )
-                )
-            lengths = torch.tensor([t.size(0) for t in seqs], device=self.device)
-            input_ids = pad_sequence(
-                seqs,
-                batch_first=True,
-                padding_value=0,
-            )
-            mask = torch.arange(input_ids.size(1), device=self.device)[None, :] < lengths[:, None]
-            
-            return input_ids, handle_ids, mask, prefill_state
+                length = end - handle.prefill_pos
+
+                buf.tokens[i].zero_()
+                buf.tokens[i, :length].copy_(handle.tokens[handle.prefill_pos:end])
+
+                buf.handle_ids[i] = handle.id
+                buf.offsets[i] = handle.prefill_pos
+                buf.lengths[i] = length
+
+                last_chunk.append(end == handle.tokens.size(0))
+
+            return buf, last_chunk
 
         else:
-            handle_ids = [h.id for h in batch]
-            input_ids = torch.tensor(
-                [h.input_token for h in batch],
-                device=self.device,
-                dtype=torch.long,
-            ).unsqueeze(1)
-            return input_ids, handle_ids
+            buf = self.decode_buffs[batch_size]
+            for i, handle in enumerate(batch):
+                buf.tokens[i,0] = handle.input_token
+                buf.request_slots[i] = handle.input_token
+            return buf
 
     def worker_loop(self):
         next_op = OP.PREFILL
@@ -317,17 +316,20 @@ class ModelProcessor:
 
             with torch.inference_mode():
                 if op == OP.PREFILL:
- 
-                    input_ids, handle_ids, mask, prefill_state = self._make_batch(batch, op)
-                    model_out = self.model.prefill(input_ids, handle_ids, batch_size, mask, prefill_state)
-                    final_rows = [prefill.last_chunk for prefill in prefill_state]
-                    result_batch = [handle for handle, is_final in zip(batch, final_rows) if is_final]
+                    prefill_state, last_chunk = self._make_batch(batch, op, batch_size)
+                    model_out = self.model.prefill(prefill_state)
+                    
                     results = []
-                    if any(final_rows):
-                        results = self._decode_batch(model_out, result_batch) .tolist()
+                    batch_decode = []
+                    for i in range(last_chunk):
+                        if(last_chunk[i]):
+                            results.append(model_out[i])
+                            batch_decode.append(batch[i])
+                    if any(batch_decode):
+                        results = self._decode_batch(results, batch_decode) .tolist()
                 else:
-                    input_ids, handle_ids = self._make_batch(batch, op)
-                    model_out = self.model.decode(input_ids, handle_ids, batch_size)
+                    decode_state = self._make_batch(batch, op, batch_size)
+                    model_out = self.model.decode(decode_state)
                     results = self._decode_batch(model_out, batch).tolist()
 
             with self.cv:
