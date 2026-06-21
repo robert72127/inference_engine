@@ -264,7 +264,6 @@ class ModelProcessor:
     def _make_batch(self, batch: list[ServerHandle], op: OP, batch_size:int):
         if op == OP.PREFILL:
             buf = self.prefill_buffs[batch_size]
-
             last_chunk = []
             for i, handle in enumerate(batch):
                 end = min(handle.prefill_pos + self.prefill_chunk_size, handle.tokens.size(0))
@@ -280,7 +279,6 @@ class ModelProcessor:
                 last_chunk.append(end == handle.tokens.size(0))
 
             return buf, last_chunk
-
         else:
             buf = self.decode_buffs[batch_size]
             for i, handle in enumerate(batch):
@@ -318,7 +316,6 @@ class ModelProcessor:
                 if op == OP.PREFILL:
                     prefill_state, last_chunk = self._make_batch(batch, op, batch_size)
                     model_out = self.model.prefill(prefill_state)
-                    
                     results = []
                     batch_decode = []
                     for i in range(last_chunk):
@@ -338,9 +335,10 @@ class ModelProcessor:
                     self.in_flight.discard(handle.id)
                     released =  handle.id not in self.handles
                     if op == OP.PREFILL:
-                        prefill = prefill_state[batch_idx]
-                        handle.prefill_pos += int(prefill.length.item())
-                        if not prefill.last_chunk and not released:
+                        seq_len = prefill_state.seq_lens[batch_idx]
+                        last_chunk[batch_idx]
+                        handle.prefill_pos += seq_len
+                        if not last_chunk and not released:
                             self.prefill_waiting.append(handle)
                         tok = results[result_idx]
                         result_idx += 1
