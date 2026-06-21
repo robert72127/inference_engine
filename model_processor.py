@@ -296,11 +296,7 @@ class ModelProcessor:
                 device=self.device,
                 dtype=torch.long,
             ).unsqueeze(1)
-            state = ModelForwardState(
-                tokens=input_ids,
-                uuid=tuple(handle_ids),
-            )
-            return input_ids, state
+            return input_ids, handle_ids
 
     def worker_loop(self):
         next_op = OP.PREFILL
@@ -312,8 +308,6 @@ class ModelProcessor:
                 if self.prefill_waiting and (next_op == OP.PREFILL or not self.generating):
                     available_slots = self._get_max_available_occupancy_left()
                     if available_slots == 0:
-                        if not self.generating:
-                            continue
                         next_op = OP.GENERATE
                         continue
                     op = OP.PREFILL
@@ -328,16 +322,11 @@ class ModelProcessor:
                     op = OP.GENERATE
                     batch = self.generating[:batch_size]
 
-            with self.cv:
-                batch = [handle for handle in batch if handle.id in self.handles]
-                if not batch:
-                    next_op = OP.PREFILL if op == OP.GENERATE else OP.GENERATE
-                    continue
                 self.in_flight.update(handle.id for handle in batch)
 
             with torch.inference_mode():
-                input_ids, state = self._make_batch(batch, op)
                 if op == OP.PREFILL:
+                    input_ids, state = self._make_batch(batch, op)
                     model_out = self.model.prefill(input_ids, state, batch_size)
                     final_rows = [prefill.last_chunk for prefill in state.prefill_state]
                     result_batch = [handle for handle, is_final in zip(batch, final_rows) if is_final]
@@ -345,9 +334,9 @@ class ModelProcessor:
                     if any(final_rows):
                         results = self._decode_batch(model_out, result_batch) .tolist()
                 else:
-                    model_out = self.model.decode(input_ids, state, batch_size)
-                    result_batch = batch
-                    results = self._decode_batch(model_out, result_batch).tolist()
+                    input_ids, handle_ids = self._make_batch(batch, op)
+                    model_out = self.model.decode(input_ids, handle_ids, input_ids, batch_size)
+                    results = self._decode_batch(model_out, batch).tolist()
 
             with self.cv:
                 result_idx = 0
@@ -357,11 +346,8 @@ class ModelProcessor:
                     if op == OP.PREFILL:
                         prefill = state.prefill_state[batch_idx]
                         handle.prefill_pos += int(prefill.length.item())
-                        is_final_chunk = prefill.last_chunk
-                        if not is_final_chunk:
-                            if not released:
-                                self.prefill_waiting.append(handle)
-                            continue
+                        if not prefill.last_chunk and not released:
+                            self.prefill_waiting.append(handle)
                         tok = results[result_idx]
                         result_idx += 1
                     else:
@@ -375,10 +361,7 @@ class ModelProcessor:
                     )
                     if tok == self.eos_token_id or released or reached_limit:
                         handle.finished = True
-                        self.generating = [
-                            h for h in self.generating
-                            if h.id != handle.id
-                        ]
+                        self.generating = [h for h in self.generating if h.id != handle.id]
                         self.handles.pop(handle.id, None)
                         self._release_caches(handle.id)
                     elif op == OP.PREFILL:

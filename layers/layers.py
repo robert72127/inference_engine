@@ -127,16 +127,15 @@ class MultiQueryAttention:
         out = torch.zeros_like(x)
         for bidx in range(batch_size):
             prefill = state.prefill_state[bidx]
+            uuid = state.uuid[bidx]
             chunk_len = int(prefill.length.item())
-            if chunk_len == 0:
-                continue
 
             chunk_start = prefill.offset
             chunk_end = chunk_start + chunk_len
             row = x[bidx:bidx + 1, :chunk_len, :]
 
             pages_info, cached_chunk_tokens = self.KV_cache.get_prefill_chunk_info(
-                state.uuid[bidx],
+                uuid,
                 chunk_start,
                 chunk_len,
             )
@@ -178,7 +177,7 @@ class MultiQueryAttention:
                 vh[:, chunk_start + cached_chunk_tokens:chunk_end, :] = v_suffix[0]
                 write_len = chunk_len - cached_chunk_tokens
                 self.KV_cache.prefill(
-                    (state.uuid[bidx],),
+                    (uuid,),
                     state.tokens[bidx:bidx + 1, cached_chunk_tokens:chunk_len],
                     k_suffix,
                     v_suffix,
@@ -212,11 +211,7 @@ class MultiQueryAttention:
             vh[:, tokens_seen:tokens_seen + valid_tokens, :] = v_block[:, :valid_tokens, :]
             tokens_seen += valid_tokens
 
-    def decode(self, x:torch.Tensor, state: ModelForwardState):
-        tokens = state.tokens
-        uuid = state.uuid
-        # x, tokens, uuid are all of shape batch X ...
-    #def _generate(self, x:torch.Tensor, tokens:torch.Tensor, uuid:torch.Tensor):
+    def decode(self, x:torch.Tensor, uuid:list[int], tokens:torch.tensor):
         Q = self.q_weights(x)
         K = self.k_weights(x)
         V = self.v_weights(x)
@@ -307,9 +302,9 @@ class TransformerBlock:
         self.attention = attention
         self.residual_rms = residual_rms
 
-    def decode(self, x:torch.Tensor, state:ModelForwardState):
+    def decode(self, x:torch.Tensor, uuid:list[int], tokens:torch.tensor):
         attn_in = self.pre_norm(x)
-        x, mlp_in = self.residual_rms(x, self.attention.decode(attn_in, state))
+        x, mlp_in = self.residual_rms(x, self.attention.decode(attn_in, uuid, tokens))
         return x + self.mlp(mlp_in)
 
     def prefill(self, x:torch.Tensor, state:ModelForwardState):

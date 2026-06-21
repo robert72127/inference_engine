@@ -281,10 +281,10 @@ class Qwen2_5_0_5B_Instruct(Model):
             out = layer(out)
         return out
 
-    def decode(self,input:torch.Tensor, state:ModelForwardState, batch_size:int):
+    def decode(self,input:torch.Tensor, uuid:list[int], tokens:torch.Tensor, batch_size:int):
         out = self.input_embed(input.to(self.device))
-        for transformer_layer in self.transformer_blocks: 
-            out = transformer_layer.decode(out, state)        
+        for transformer_layer in self.transformer_blocks:
+            out = transformer_layer.decode(out, uuid, tokens)        
         out = out[:, -1, :]
         for layer in self.output_layers:
             out = layer(out)

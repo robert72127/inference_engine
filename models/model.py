@@ -8,7 +8,7 @@ class PrefillState:
     offset: int
     last_chunk: bool
     prompt_tokens: list[int]
-    length: torch.Tensor | None = None
+    length: int
 
 @dataclass(frozen=True)
 class ModelForwardState:
@@ -28,7 +28,7 @@ class Model(ABC):
         pass
 
     @abstractmethod
-    def decode(self,input:torch.Tensor, state:ModelForwardState, batch_size:int):
+    def decode(self,input:torch.Tensor, uuid:list[int], tokens:torch.Tensor, batch_size:int):
         pass
 
     @abstractmethod
