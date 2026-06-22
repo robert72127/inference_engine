@@ -33,10 +33,9 @@ class ServerHandle:
         self.tokens = tokens
         self.temperature = temperature
         self.top_p = top_p
-        self.cache_len = int(tokens.size(0))
         self.max_new_tokens = max_new_tokens
         self.generated_tokens = 0
-        self.prefill_pos = 0
+        self.cache_pos = 0
 
         #  previous token for generation.
         self.input_token: int | None = None
@@ -266,14 +265,14 @@ class ModelProcessor:
             buf = self.prefill_buffs[batch_size]
             last_chunk = []
             for i, handle in enumerate(batch):
-                end = min(handle.prefill_pos + self.prefill_chunk_size, handle.tokens.size(0))
-                length = end - handle.prefill_pos
+                end = min(handle.cache_pos + self.prefill_chunk_size, handle.tokens.size(0))
+                length = end - handle.cache_pos
 
                 buf.tokens[i].zero_()
-                buf.tokens[i, :length].copy_(handle.tokens[handle.prefill_pos:end])
+                buf.tokens[i, :length].copy_(handle.tokens[handle.cache_pos:end])
 
                 buf.handle_ids[i] = handle.id
-                buf.offsets[i] = handle.prefill_pos
+                buf.offsets[i] = handle.cache_pos
                 buf.lengths[i] = length
 
                 last_chunk.append(end == handle.tokens.size(0))
@@ -284,6 +283,7 @@ class ModelProcessor:
             for i, handle in enumerate(batch):
                 buf.tokens[i,0] = handle.input_token
                 buf.request_slots[i] = handle.input_token
+                buf.offsets[i] = handle.cache_pos
             return buf
 
     def worker_loop(self):
@@ -318,12 +318,12 @@ class ModelProcessor:
                     model_out = self.model.prefill(prefill_state)
                     results = []
                     batch_decode = []
-                    for i in range(last_chunk):
-                        if(last_chunk[i]):
+                    for i in range(len(last_chunk)):
+                        if last_chunk[i]:
                             results.append(model_out[i])
                             batch_decode.append(batch[i])
-                    if any(batch_decode):
-                        results = self._decode_batch(results, batch_decode) .tolist()
+                    if batch_decode:
+                        results = self._decode_batch(torch.stack(results), batch_decode).tolist()
                 else:
                     decode_state = self._make_batch(batch, op, batch_size)
                     model_out = self.model.decode(decode_state)
@@ -336,19 +336,20 @@ class ModelProcessor:
                     released =  handle.id not in self.handles
                     if op == OP.PREFILL:
                         seq_len = prefill_state.seq_lens[batch_idx]
-                        last_chunk[batch_idx]
-                        handle.prefill_pos += seq_len
-                        if not last_chunk and not released:
-                            self.prefill_waiting.append(handle)
+                        handle.cache_pos += seq_len
+                        if not last_chunk[batch_idx]:
+                            if not released:
+                                self.prefill_waiting.append(handle)
+                            continue
                         tok = results[result_idx]
                         result_idx += 1
                     else:
                         tok = results[batch_idx]
-                        handle.cache_len += 1
+                        handle.cache_pos += 1
                         handle.generated_tokens += 1
                     handle.input_token = tok
                     reached_limit = (
-                        handle.cache_len >= self.max_request_len
+                        handle.cache_pos >= self.max_request_len
                         or handle.generated_tokens >= handle.max_new_tokens
                     )
                     if tok == self.eos_token_id or released or reached_limit:

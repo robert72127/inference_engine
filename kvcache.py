@@ -148,8 +148,6 @@ class RadixKVCache:
                 last_block_occp = self.write_block_occupancy
             return indexes, last_block_occp
 
-        def get_next_idx(self): return len(self.commited_blocks) * self.block_size + self.write_block_occupancy
-
         def commit_write_block(self):
             self.write_block = self.kv_cache.radix_insert(self.uuid, self.write_block, self.write_block_toks)
             self.commited_blocks.append(self.write_block)
@@ -278,10 +276,6 @@ class RadixKVCache:
             for i in range(0, len(toks) - len(toks) % self.block_size, self.block_size)
         ]
 
-    def next_token_position(self, uuid):
-        uuid_state = self.uuids[uuid]
-        return uuid_state.get_next_idx()
-        
     # first step in prefill, serach for pages matching longest prefix of toks
     def init(self, uuid, toks):
         blocks, blocks_cnt = self.trie_search(uuid, self.tokens_to_blocks(toks))

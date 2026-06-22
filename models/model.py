@@ -19,6 +19,7 @@ class DecodeStateBuff:
         self.batch_size = batch_size
         self.tokens = torch.empty((batch_size, 1), device=device, dtype=torch.long)
         self.request_slots = torch.empty((batch_size,), device=device, dtype=torch.int32)
+        self.offsets = torch.empty((batch_size,), device=device, dtype=torch.int32)
 
 class Model(ABC):
     def __init__(self, device: torch.device):
