@@ -271,9 +271,9 @@ class ModelProcessor:
                 buf.tokens[i].zero_()
                 buf.tokens[i, :length].copy_(handle.tokens[handle.cache_pos:end])
 
-                buf.handle_ids[i] = handle.id
+                buf.request_slots[i] = handle.id
                 buf.offsets[i] = handle.cache_pos
-                buf.lengths[i] = length
+                buf.seq_lens[i] = length
 
                 last_chunk.append(end == handle.tokens.size(0))
 
@@ -282,7 +282,7 @@ class ModelProcessor:
             buf = self.decode_buffs[batch_size]
             for i, handle in enumerate(batch):
                 buf.tokens[i,0] = handle.input_token
-                buf.request_slots[i] = handle.input_token
+                buf.request_slots[i] = handle.id
                 buf.offsets[i] = handle.cache_pos
             return buf
 

@@ -270,17 +270,17 @@ class Qwen2_5_0_5B_Instruct(Model):
         )
     
     def prefill(self, state_buff:PrefillStateBuff):
-        out = self.input_embed(input.tokens)
+        out = self.input_embed(state_buff.tokens.to(self.device))
         for transformer_layer in self.transformer_blocks: 
             out = transformer_layer.prefill(out, state_buff)
         batch_idx = torch.arange(out.size(0), device=out.device)
-        out = out[batch_idx, input.seq_lens]
+        out = out[batch_idx, state_buff.seq_lens - 1]
         for layer in self.output_layers:
             out = layer(out)
         return out
 
     def decode(self, state_buff:DecodeStateBuff):
-        out = self.input_embed(input.tokens.to(self.device))
+        out = self.input_embed(state_buff.tokens.to(self.device))
         for transformer_layer in self.transformer_blocks:
             out = transformer_layer.decode(out, state_buff)        
         out = out[:, -1, :]
