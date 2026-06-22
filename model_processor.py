@@ -391,4 +391,4 @@ class ModelProcessor:
 
     def _release_caches(self, handle_id: int):
         for cache in self.kv_caches:
-            cache.release((handle_id,))
+            cache.release(handle_id)

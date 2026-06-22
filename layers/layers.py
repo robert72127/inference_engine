@@ -5,7 +5,7 @@ import math
 
 from kvcache import RadixKVCache
 from layers.triton_kernels import paged_mqa_decode, residual_rms
-from models.model import PrefillInput, DecodeInput
+from models.model import PrefillStateBuff, DecodeStateBuff
 
 class Embedding:
     def __init__(self, weights:torch.Tensor):
@@ -140,32 +140,56 @@ class MultiQueryAttention:
         return Qh, Kh, Vh
 
 
-    def prefill(self, x, input_meta:PrefillInput):
-        uuid = input_meta.uuid
+    def prefill(self, x, input_meta:PrefillStateBuff):
+        request_slots = input_meta.request_slots
         tokens = input_meta.tokens
         batch_size = x.size(0)
-        pos_start = input_meta.offests
-        pos_end = pos_start+ input_meta.seq_len
-        rope_positions = torch.arange(start=pos_start, end=pos_end, dtype=torch.int32, device=x.device)
+        seq_len = int(input_meta.seq_lens[0].item())
+        x = x[:, :seq_len, :]
+        tokens = tokens[:, :seq_len]
+        positions = torch.arange(seq_len, dtype=torch.int32, device=x.device)
+        rope_positions = input_meta.offsets[:, None] + positions[None, :]
         
-        Qh, Kh, Vh = self.attention_prologue(x, rope_positions)
-
-        for idx in range(0, batch_size):
-            self.KV_cache.append_prefill(uuid[idx], Kh[idx], Vh[idx], tokens[idx])
-
-
-    def decode(self, x:torch.Tensor, input_meta:DecodeInput):
-        uuid = input_meta.uuid
-        batch_size = x.shape[0]
-        tokens = input_meta.tokens       
-        rope_positions = input_meta.offsets
         Qh, Kh, Vh = self.attention_prologue(x, rope_positions)
 
         page_indexes = []
         for idx in range(0, batch_size):
-            self.KV_cache.append_decode(uuid[idx], Kh[idx], Vh[idx], tokens[idx])
-            page_indexes.append(self.KV_cache.get_indexes(uuid[idx]))
+            request_slot = int(request_slots[idx].item())
+            self.KV_cache.append_prefill(
+                request_slot,
+                tokens[idx],
+                Kh[idx],
+                Vh[idx],
+            )
+            page_indexes.append(self.KV_cache.get_indexes(request_slot))
 
+        out = torch.zeros(
+            batch_size,
+            self.num_attn_heads,
+            seq_len,
+            self.head_dim,
+            dtype=x.dtype,
+            device=x.device,
+        )
+        self._paged_prefill_cpu(input_meta.offsets, input_meta.seq_lens, page_indexes, batch_size, Qh, out)
+        out = rearrange(out, "b h l d -> b l (h d)")
+        return self.outproj(out)
+
+
+    def decode(self, x:torch.Tensor, input_meta:DecodeStateBuff):
+        request_slots = input_meta.request_slots
+        batch_size = x.shape[0]
+        tokens = input_meta.tokens       
+        rope_positions = input_meta.offsets[:, None]
+        Qh, Kh, Vh = self.attention_prologue(x, rope_positions)
+
+        page_indexes = []
+        for idx in range(0, batch_size):
+            request_slot = int(request_slots[idx].item())
+            self.KV_cache.append_decode(request_slot, Kh[idx, :, 0, :], Vh[idx, :, 0, :], tokens[idx])
+            page_indexes.append(self.KV_cache.get_indexes(request_slot))
+
+        token_counts = input_meta.offsets + 1
         out = torch.zeros(
                     batch_size,
                     self.num_attn_heads,
@@ -181,25 +205,25 @@ class MultiQueryAttention:
                 page_indexes = padded_indexes,
                 page_index_stride = padded_indexes.stride(0),
                 batch_size = batch_size,
-                tok_cnt= input_meta.offsets,
+                tok_cnt= token_counts,
                 seq_len_per_page=self.KV_cache.block_size,
                 d_head=self.head_dim,
                 num_attn_heads=self.num_attn_heads,
                 num_kv_heads=self.num_kv_heads,
             )
         else:
-            self._paged_mqa_cpu(input_meta.offsets, page_indexes, batch_size, Qh, out)
+            self._paged_decode_cpu(token_counts, page_indexes, batch_size, Qh, out)
         out = rearrange(out, "b h d -> b 1 (h d)")
         return self.outproj(out)
     
-    def _paged_mqa_cpu(self, offsets, page_indexes, batch_size, Qh, out):
+    def _paged_decode_cpu(self, token_counts, page_indexes, batch_size, Qh, out):
         group_size = self.num_attn_heads // self.num_kv_heads
         scale = 1 / math.sqrt(self.head_dim)
         kv_head_idx = torch.arange(self.num_attn_heads, device=Qh.device) // group_size
 
-        for idx, state in range(batch_size):
-            q = Qh[idx].squeeze(dim=1).to(torch.float32)
-            token_count = offsets[idx] + 1 # one computer in this iter
+        for idx in range(batch_size):
+            q = Qh[idx, :, 0, :].to(torch.float32)
+            token_count = int(token_counts[idx].item())
             m_max = torch.full((self.num_attn_heads,), float("-inf"), device=Qh.device)
             l = torch.zeros((self.num_attn_heads,), device=Qh.device)
             acc = torch.zeros(
@@ -227,6 +251,56 @@ class MultiQueryAttention:
                 tokens_seen += valid_tokens
             out[idx] = (acc / l[:, None]).to(out.dtype)
 
+    def _paged_prefill_cpu(self, offsets, seq_lens, page_indexes, batch_size, Qh, out):
+        group_size = self.num_attn_heads // self.num_kv_heads
+        scale = 1 / math.sqrt(self.head_dim)
+        kv_head_idx = torch.arange(self.num_attn_heads, device=Qh.device) // group_size
+
+        for idx in range(batch_size):
+            offset = int(offsets[idx].item())
+            seq_len = int(seq_lens[idx].item())
+            token_count = offset + seq_len
+            if seq_len <= 0:
+                continue
+
+            q = Qh[idx, :, :seq_len, :].to(torch.float32)
+            query_limits = offset + torch.arange(seq_len, device=Qh.device)
+            m_max = torch.full((self.num_attn_heads, seq_len), float("-inf"), device=Qh.device)
+            l = torch.zeros((self.num_attn_heads, seq_len), device=Qh.device)
+            acc = torch.zeros(
+                self.num_attn_heads,
+                seq_len,
+                self.head_dim,
+                dtype=torch.float32,
+                device=Qh.device,
+            )
+
+            tokens_seen = 0
+            K_pages, V_pages = self.KV_cache.get_pages(page_indexes[idx])
+            for k_block, v_block in zip(K_pages, V_pages):
+                valid_tokens = min(self.KV_cache.block_size, token_count - tokens_seen)
+                if valid_tokens <= 0:
+                    break
+
+                k_block = k_block[:, :valid_tokens, :][kv_head_idx].to(torch.float32)
+                v_block = v_block[:, :valid_tokens, :][kv_head_idx].to(torch.float32)
+                scores = torch.einsum("h q d, h s d -> h q s", q, k_block) * scale
+
+                key_positions = tokens_seen + torch.arange(valid_tokens, device=Qh.device)
+                causal_mask = key_positions[None, :] <= query_limits[:, None]
+                scores = scores.masked_fill(~causal_mask[None, :, :], float("-inf"))
+
+                m_block = scores.max(dim=-1).values
+                m_new = torch.maximum(m_max, m_block)
+                old_rescale = torch.exp(m_max - m_new)
+                m_max = m_new
+                weight = torch.exp(scores - m_max[:, :, None])
+                l = l * old_rescale + torch.sum(weight, dim=-1)
+                acc = acc * old_rescale[:, :, None] + torch.einsum("h q s, h s d -> h q d", weight, v_block)
+                tokens_seen += valid_tokens
+
+            out[idx, :, :seq_len, :] = (acc / l[:, :, None]).to(out.dtype)
+
 class TransformerBlock:
     def __init__(self, mlp, pre_norm, attention, residual_rms):
         self.mlp = mlp
@@ -234,12 +308,14 @@ class TransformerBlock:
         self.attention = attention
         self.residual_rms = residual_rms
 
-    def decode(self, x:torch.Tensor, input_meta:DecodeInput):
+    def decode(self, x:torch.Tensor, input_meta:DecodeStateBuff):
         attn_in = self.pre_norm(x)
         x, mlp_in = self.residual_rms(x, self.attention.decode(attn_in, input_meta))
         return x + self.mlp(mlp_in)
 
-    def prefill(self, x, input_meta:PrefillInput):
+    def prefill(self, x, input_meta:PrefillStateBuff):
+        seq_len = int(input_meta.seq_lens[0].item())
+        x = x[:, :seq_len, :]
         attn_in = self.pre_norm(x)
         x, mlp_in = self.residual_rms(x, self.attention.prefill(attn_in, input_meta))
         return x + self.mlp(mlp_in)

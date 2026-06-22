@@ -135,6 +135,7 @@ class RadixKVCache:
             self.kv_cache = kv_cache
             self.block_size = block_size
             self.commited_blocks = commited_blocks
+            self.blocks_count = blocks_count
 
             self.write_block = None
             self.write_block_toks = []
@@ -149,7 +150,7 @@ class RadixKVCache:
             return indexes, last_block_occp
 
         def commit_write_block(self):
-            self.write_block = self.kv_cache.radix_insert(self.uuid, self.write_block, self.write_block_toks)
+            self.write_block = self.kv_cache.trie_insert(self.uuid, self.write_block, self.write_block_toks)
             self.commited_blocks.append(self.write_block)
             self.write_block = None
             self.write_block_occupancy = 0
@@ -159,6 +160,7 @@ class RadixKVCache:
             if self.write_block is None:
                 self.write_block = self.kv_cache.allocate_blocks()[0]
                 self.write_block_occupancy = 0
+                self.blocks_count += 1
                 self.write_block_toks = []
 
         def insert_single(self, tok, k,v):
@@ -173,7 +175,7 @@ class RadixKVCache:
 
         def insert_seq(self, toks, k, v):
             src_start = 0
-            remaining_tokens = toks.len()
+            remaining_tokens = toks.numel()
             while remaining_tokens > 0:
                 if self.write_block is None:
                     self.alloc_write_block()
@@ -237,7 +239,7 @@ class RadixKVCache:
         self.prefix_trie.set_last_node(uuid, nodes[-1] if nodes else self.prefix_trie.root)
         return pages, len(nodes)
 
-    def release_uuid(self, uuid):
+    def release(self, uuid):
         uuid_state = self.uuids.pop(uuid, None)
         if uuid_state is None:
             self.prefix_trie.remove_uuid(uuid)
