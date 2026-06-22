@@ -264,6 +264,11 @@ class RadixKVCache:
         V_ = [self.V[ind] for ind in indexes]
         return K_, V_
 
+    def get_indexes(self, uuid):
+        uuid_state = self.uuids[uuid]
+        indexes, _ = uuid_state.get_indexes_aand_occupancy()
+        return indexes
+
     def get_blocks_available(self):
         reserved = 0
         for uuid_state in self.uuids.values():
