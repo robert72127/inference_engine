@@ -199,8 +199,12 @@ class MultiQueryAttention:
                 )
 
         if x.device.type == "cuda":
-            padded_indexes = pad_sequence(page_indexes,batch_first=True,padding_value=-1)
-            attn_out = paged_mqa_decode(
+            page_index_tensors = [
+                torch.tensor(indexes, dtype=torch.int32, device=x.device)
+                for indexes in page_indexes
+            ]
+            padded_indexes = pad_sequence(page_index_tensors, batch_first=True, padding_value=-1)
+            paged_mqa_decode(
                 q=Qh, K_cache=self.KV_cache.K, V_cache=self.KV_cache.V, out=out,
                 page_indexes = padded_indexes,
                 page_index_stride = padded_indexes.stride(0),
