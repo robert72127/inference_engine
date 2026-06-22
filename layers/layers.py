@@ -120,101 +120,8 @@ class MultiQueryAttention:
         self.k_bias = None if k_bias is None else k_bias
         self.v_bias = None if v_bias is None else v_bias
 
-    def prefill(self, x, input_meta:PrefillInput):
-        batch_size = x.size(0)
 
-        # first call init for any uuids that have the first chunk in this batch
-        out = torch.zeros_like(x)
-        for bidx in range(batch_size):
-            prefill = state[bidx]
-            request_uuid = uuid[bidx]
-            chunk_len = int(prefill.length.item())
-
-            chunk_start = prefill.offset
-            chunk_end = chunk_start + chunk_len
-            row = x[bidx:bidx + 1, :chunk_len, :]
-
-            pages_info, cached_chunk_tokens = self.KV_cache.get_prefill_chunk_info(
-                request_uuid,
-                chunk_start,
-                chunk_len,
-            )
-            if cached_chunk_tokens == chunk_len:
-                if not prefill.last_chunk:
-                    continue
-                query_start = chunk_len - 1
-            else:
-                query_start = cached_chunk_tokens
-
-            query_x = row[:, query_start:chunk_len, :]
-            query_len = chunk_len - query_start
-            query_offset = chunk_start + query_start
-            q = self.q_weights(query_x)
-            q = q + self.q_bias if self.q_bias is not None else q
-            qh = rearrange(q, "b l (h d) -> b h l d", h=self.num_attn_heads)
-            if self.rope is not None:
-                q_positions = torch.arange(query_offset, chunk_end, device=row.device).unsqueeze(0)
-                qh = self.rope(qh, position=q_positions)
-
-            cached_tokens = chunk_start + cached_chunk_tokens
-            kh = torch.zeros((self.num_kv_heads, chunk_end, self.head_dim), device=row.device, dtype=row.dtype)
-            vh = torch.zeros_like(kh)
-            if cached_tokens > 0:
-                self._load_cached_prefix(kh, vh, pages_info["indexes"], cached_tokens)
-
-            if cached_chunk_tokens < chunk_len:
-                suffix_x = row[:, cached_chunk_tokens:chunk_len, :]
-                k = self.k_weights(suffix_x)
-                v = self.v_weights(suffix_x)
-                k = k + self.k_bias if self.k_bias is not None else k
-                v = v + self.v_bias if self.v_bias is not None else v
-                k_suffix = rearrange(k, "b l (h d) -> b h l d", h=self.num_kv_heads)
-                v_suffix = rearrange(v, "b l (h d) -> b h l d", h=self.num_kv_heads)
-                if self.rope is not None:
-                    suffix_positions = torch.arange(chunk_start + cached_chunk_tokens, chunk_end, device=row.device).unsqueeze(0)
-                    k_suffix = self.rope(k_suffix, position=suffix_positions)
-                kh[:, chunk_start + cached_chunk_tokens:chunk_end, :] = k_suffix[0]
-                vh[:, chunk_start + cached_chunk_tokens:chunk_end, :] = v_suffix[0]
-                write_len = chunk_len - cached_chunk_tokens
-                self.KV_cache.prefill(
-                    (request_uuid,),
-                    tokens[bidx:bidx + 1, cached_chunk_tokens:chunk_len],
-                    k_suffix,
-                    v_suffix,
-                    torch.ones((1, write_len), device=tokens.device, dtype=torch.bool),
-                )
-
-            group = self.num_attn_heads // self.num_kv_heads
-            qg = qh[0].view(self.num_kv_heads, group, query_len, self.head_dim)
-            kg = kh.unsqueeze(1)
-            vg = vh.unsqueeze(1)
-            attn_scores = torch.matmul(qg, kg.transpose(-1, -2)) / math.sqrt(self.head_dim)
-            query_positions = torch.arange(query_offset, chunk_end, device=attn_scores.device)
-            key_positions = torch.arange(chunk_end, device=attn_scores.device)
-            causal = key_positions.unsqueeze(0) > query_positions.unsqueeze(1)
-            attn_scores = attn_scores.masked_fill(causal[None, None, :, :], float("-inf"))
-            attn = attn_scores.softmax(dim=-1)
-            out_g = torch.matmul(attn, vg)
-            out_heads = rearrange(out_g, "h_kv g l d -> l (h_kv g d)")
-            out[bidx:bidx + 1, query_start:chunk_len, :] = self.outproj(out_heads.unsqueeze(0))
-        
-        return out
-
-    def _load_cached_prefix(self, kh: torch.Tensor, vh: torch.Tensor, indexes, cached_tokens: int):
-        tokens_seen = 0
-        K_pages, V_pages = self.KV_cache.get_pages(indexes)
-        for k_block, v_block in zip(K_pages, V_pages):
-            valid_tokens = min(self.KV_cache.block_size, cached_tokens - tokens_seen)
-            if valid_tokens <= 0:
-                break
-            kh[:, tokens_seen:tokens_seen + valid_tokens, :] = k_block[:, :valid_tokens, :]
-            vh[:, tokens_seen:tokens_seen + valid_tokens, :] = v_block[:, :valid_tokens, :]
-            tokens_seen += valid_tokens
-
-    def decode(self, x:torch.Tensor, input_meta:DecodeInput):
-        uuid = input_meta.uuid
-        tokens = input_meta.tokens       
-        batch_size = x.shape[0]
+    def attention_prologue(self, x, rope_positions):
         Q = self.q_weights(x)
         K = self.k_weights(x)
         V = self.v_weights(x)
@@ -225,52 +132,74 @@ class MultiQueryAttention:
         Qh = rearrange(Q, "b l (h d) -> b h l d", h=self.num_attn_heads)
         Kh = rearrange(K, "b l (h d) -> b h l d", h=self.num_kv_heads)
         Vh = rearrange(V, "b l (h d) -> b h l d", h=self.num_kv_heads)
-        q_positions = self.KV_cache.get_q_position(uuid)
+        
         if self.rope is not None:
-            Qh = self.rope(Qh, position=q_positions)
-            Kh = self.rope(Kh, position=q_positions)
+            Qh = self.rope(Qh, position=rope_positions)
+            Kh = self.rope(Kh, position=rope_positions)
 
-        pages_info = self.KV_cache.append_and_fetch(uuid, Kh, Vh, tokens[:, 0])
-        seq_len_per_page = self.KV_cache.block_size
+        return Qh, Kh, Vh
+
+
+    def prefill(self, x, input_meta:PrefillInput):
+        uuid = input_meta.uuid
+        tokens = input_meta.tokens
+        batch_size = x.size(0)
+        pos_start = input_meta.offests
+        pos_end = pos_start+ input_meta.seq_len
+        rope_positions = torch.arange(start=pos_start, end=pos_end, dtype=torch.int32, device=x.device)
+        
+        Qh, Kh, Vh = self.attention_prologue(x, rope_positions)
+
+        for idx in range(0, batch_size):
+            self.KV_cache.append_prefill(uuid[idx], Kh[idx], Vh[idx], tokens[idx])
+
+
+    def decode(self, x:torch.Tensor, input_meta:DecodeInput):
+        uuid = input_meta.uuid
+        batch_size = x.shape[0]
+        tokens = input_meta.tokens       
+        rope_positions = input_meta.offsets
+        Qh, Kh, Vh = self.attention_prologue(x, rope_positions)
+
+        page_indexes = []
+        for idx in range(0, batch_size):
+            self.KV_cache.append_decode(uuid[idx], Kh[idx], Vh[idx], tokens[idx])
+            page_indexes.append(self.KV_cache.get_indexes(uuid[idx]))
+
         out = torch.zeros(
-                    x.shape[0],
+                    batch_size,
                     self.num_attn_heads,
                     self.head_dim,
-                    dtype=Q.dtype,
-                    device=Q.device,
+                    dtype=x.dtype,
+                    device=x.device,
                 )
 
         if x.device.type == "cuda":
-
-            page_indexes = [torch.tensor(pm["indexes"], device=x.device) for pm in pages_info]
             padded_indexes = pad_sequence(page_indexes,batch_first=True,padding_value=-1)
-
             attn_out = paged_mqa_decode(
                 q=Qh, K_cache=self.KV_cache.K, V_cache=self.KV_cache.V, out=out,
                 page_indexes = padded_indexes,
                 page_index_stride = padded_indexes.stride(0),
                 batch_size = batch_size,
-                tok_cnt= torch.tensor([page["token_count"] for page in pages_info], device=Q.device),
-                seq_len_per_page=seq_len_per_page,
+                tok_cnt= input_meta.offsets,
+                seq_len_per_page=self.KV_cache.block_size,
                 d_head=self.head_dim,
                 num_attn_heads=self.num_attn_heads,
                 num_kv_heads=self.num_kv_heads,
             )
-
         else:
-            self._paged_mqa_cpu(pages_info, Qh, out)
-
+            self._paged_mqa_cpu(input_meta.offsets, page_indexes, batch_size, Qh, out)
         out = rearrange(out, "b h d -> b 1 (h d)")
         return self.outproj(out)
     
-    def _paged_mqa_cpu(self, pages_info, Qh, out):
+    def _paged_mqa_cpu(self, offsets, page_indexes, batch_size, Qh, out):
         group_size = self.num_attn_heads // self.num_kv_heads
         scale = 1 / math.sqrt(self.head_dim)
         kv_head_idx = torch.arange(self.num_attn_heads, device=Qh.device) // group_size
 
-        for idx, state in enumerate(pages_info):
+        for idx, state in range(batch_size):
             q = Qh[idx].squeeze(dim=1).to(torch.float32)
-            token_count = state["token_count"]
+            token_count = offsets[idx] + 1 # one computer in this iter
             m_max = torch.full((self.num_attn_heads,), float("-inf"), device=Qh.device)
             l = torch.zeros((self.num_attn_heads,), device=Qh.device)
             acc = torch.zeros(
@@ -280,7 +209,7 @@ class MultiQueryAttention:
                 device=Qh.device,
             )
             tokens_seen = 0
-            K_pages,V_pages = self.KV_cache.get_pages(state["indexes"])
+            K_pages, V_pages = self.KV_cache.get_pages(page_indexes[idx])
             for k_block, v_block in zip(K_pages, V_pages):
                 valid_tokens = min(self.KV_cache.block_size, token_count - tokens_seen)
                 if valid_tokens <= 0:
