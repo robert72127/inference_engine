@@ -140,18 +140,24 @@ class RadixKVCache:
             self.write_block = None
             self.write_block_toks = []
             self.write_block_occupancy = 0
+            self.pending_full_blocks = []
 
         def get_indexes_and_occupancy(self):
             indexes = list(self.commited_blocks) # list so we dont accidentaly modify state
+            indexes.extend(block for block, _ in self.pending_full_blocks)
             last_block_occp = self.block_size
             if self.write_block is not None:
                 indexes.append(self.write_block)
                 last_block_occp = self.write_block_occupancy
             return indexes, last_block_occp
 
+        def commit_block(self, block, toks):
+            block = self.kv_cache.trie_insert(self.uuid, block, toks)
+            self.commited_blocks.append(block)
+            return block
+
         def commit_write_block(self):
-            self.write_block = self.kv_cache.trie_insert(self.uuid, self.write_block, self.write_block_toks)
-            self.commited_blocks.append(self.write_block)
+            self.commit_block(self.write_block, self.write_block_toks)
             self.write_block = None
             self.write_block_occupancy = 0
             self.write_block_toks = []
@@ -165,40 +171,48 @@ class RadixKVCache:
 
 
         def insert_single(self, tok):
+            if self.write_block is None:
+                self.alloc_write_block()
+
             if self.write_block_occupancy == self.kv_cache.block_size:
                 self.commit_write_block()
                 self.alloc_write_block()
 
-            #self.kv_cache.K[self.write_block][:, self.write_block_occupancy, :] = k 
-            #self.kv_cache.V[self.write_block][:, self.write_block_occupancy, :] = v
-
-            self.write_block_toks.append(tok)
+            self.write_block_toks.append(int(tok.item()) if torch.is_tensor(tok) else int(tok))
             self.write_block_occupancy+=1
 
-        def insert_seq(self, toks, k, v):
+        def reserve_seq(self, toks):
+            toks_list = [int(tok) for tok in toks.detach().cpu().tolist()]
             src_start = 0
-            remaining_tokens = toks.numel()
+            remaining_tokens = len(toks_list)
             while remaining_tokens > 0:
                 if self.write_block is None:
                     self.alloc_write_block()
 
                 if self.write_block_occupancy == self.kv_cache.block_size:
-                    self.commit_write_block()
+                    self.pending_full_blocks.append((self.write_block, self.write_block_toks))
+                    self.write_block = None
+                    self.write_block_occupancy = 0
+                    self.write_block_toks = []
                     self.alloc_write_block()
 
                 fill_tokens = min(remaining_tokens, self.block_size - self.write_block_occupancy)
-                dst_start = self.write_block_occupancy
-                dst_end = dst_start + fill_tokens
+                dst_end = self.write_block_occupancy + fill_tokens
                 src_end = src_start + fill_tokens
 
-                self.kv_cache.K[self.write_block][:, dst_start:dst_end, :] = k[:, src_start:src_end, :]
-                self.kv_cache.V[self.write_block][:, dst_start:dst_end, :] = v[:, src_start:src_end, :]
-                self.write_block_toks.extend(int(tok) for tok in toks[src_start:src_end].detach().cpu().tolist())
+                self.write_block_toks.extend(toks_list[src_start:src_end])
                 self.write_block_occupancy = dst_end
 
                 src_start += fill_tokens
                 remaining_tokens -= fill_tokens
 
+        def commit_pending_prefill(self):
+            for block, toks in self.pending_full_blocks:
+                self.commit_block(block, toks)
+            self.pending_full_blocks = []
+
+            if self.write_block is not None and self.write_block_occupancy == self.kv_cache.block_size:
+                self.commit_write_block()
 
     def __init__(self, d_head, head_cnt, num_blocks, block_size, max_requests_per_uuid=None, device=None, dtype=None):
         self.d_head = d_head
@@ -248,7 +262,7 @@ class RadixKVCache:
             return
         self.prefix_trie.remove_uuid(uuid)
 
-        blocks = uuid_state.commited_blocks + [uuid_state.write_block]
+        blocks = uuid_state.commited_blocks + [block for block, _ in uuid_state.pending_full_blocks] + [uuid_state.write_block]
         self.block_allocator.free_blocks(blocks)
 
     def allocate_blocks(self, block_cnt=1):
@@ -296,20 +310,16 @@ class RadixKVCache:
                 commited_blocks=blocks,
         )
 
-    # k, v as actuall tensors without masking for seq_dim 
-    def append_prefill(self, uuid, toks, k, v):
-        uuid_state = self.uuids[uuid]
-        uuid_state.insert_seq(toks, k,v)
-
     # appends new token logically, actuall write of new k,v happens in kernel
     def append_decode(self, uuid, tok):        
         uuid_state = self.uuids[uuid]
         uuid_state.insert_single(tok)
 
     # happens before kernel, malloc space in last block for single extra toks
-    def init_prefill(self, uuid, tok):
-        pass
+    def init_prefill(self, uuid, toks):
+        uuid_state = self.uuids[uuid]
+        uuid_state.reserve_seq(toks)
 
-    def finish_decode(self, uuid):
-        pass
-    
+    def finish_prefill(self, uuid):
+        uuid_state = self.uuids[uuid]
+        uuid_state.commit_pending_prefill()

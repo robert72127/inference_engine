@@ -1,6 +1,5 @@
 from einops import rearrange
 import torch
-from torch.nn.utils.rnn import pad_sequence
 import math
 
 from kvcache import RadixKVCache
@@ -140,28 +139,40 @@ class MultiQueryAttention:
         return Qh, Kh, Vh
 
 
+    def _write_prefill_kv(self, input_meta: PrefillStateBuff, Kh: torch.Tensor, Vh: torch.Tensor, batch_size: int):
+        block_size = self.KV_cache.block_size
+        for idx in range(batch_size):
+            offset = int(input_meta.offsets[idx].item())
+            seq_len = int(input_meta.seq_lens[idx].item())
+            written = 0
+            while written < seq_len:
+                abs_pos = offset + written
+                page_slot = abs_pos // block_size
+                page_offset = abs_pos % block_size
+                write_len = min(seq_len - written, block_size - page_offset)
+                page_idx = input_meta.page_indexes[idx, page_slot]
+                self.KV_cache.K[page_idx, :, page_offset:page_offset + write_len, :] = Kh[idx, :, written:written + write_len, :]
+                self.KV_cache.V[page_idx, :, page_offset:page_offset + write_len, :] = Vh[idx, :, written:written + write_len, :]
+                written += write_len
+
+    def _write_decode_kv(self, input_meta: DecodeStateBuff, Kh: torch.Tensor, Vh: torch.Tensor, batch_size: int):
+        block_size = self.KV_cache.block_size
+        page_slots = torch.div(input_meta.offsets, block_size, rounding_mode="floor")
+        page_offsets = input_meta.offsets % block_size
+        for idx in range(batch_size):
+            page_idx = input_meta.page_indexes[idx, page_slots[idx]]
+            self.KV_cache.K[page_idx, :, page_offsets[idx], :] = Kh[idx, :, 0, :]
+            self.KV_cache.V[page_idx, :, page_offsets[idx], :] = Vh[idx, :, 0, :]
+
     def prefill(self, x, input_meta:PrefillStateBuff):
-        request_slots = input_meta.request_slots
-        tokens = input_meta.tokens
         batch_size = x.size(0)
         seq_len = int(input_meta.seq_lens[0].item())
         x = x[:, :seq_len, :]
-        tokens = tokens[:, :seq_len]
         positions = torch.arange(seq_len, dtype=torch.int32, device=x.device)
         rope_positions = input_meta.offsets[:, None] + positions[None, :]
         
         Qh, Kh, Vh = self.attention_prologue(x, rope_positions)
-
-        page_indexes = []
-        for idx in range(0, batch_size):
-            request_slot = int(request_slots[idx].item())
-            self.KV_cache.append_prefill(
-                request_slot,
-                tokens[idx],
-                Kh[idx],
-                Vh[idx],
-            )
-            page_indexes.append(self.KV_cache.get_indexes(request_slot))
+        self._write_prefill_kv(input_meta, Kh, Vh, batch_size)
 
         out = torch.zeros(
             batch_size,
@@ -171,23 +182,16 @@ class MultiQueryAttention:
             dtype=x.dtype,
             device=x.device,
         )
-        self._paged_prefill_cpu(input_meta.offsets, input_meta.seq_lens, page_indexes, batch_size, Qh, out)
+        self._paged_prefill_cpu(input_meta.offsets, input_meta.seq_lens, input_meta.page_indexes, batch_size, Qh, out)
         out = rearrange(out, "b h l d -> b l (h d)")
         return self.outproj(out)
 
 
     def decode(self, x:torch.Tensor, input_meta:DecodeStateBuff):
-        request_slots = input_meta.request_slots
         batch_size = x.shape[0]
-        tokens = input_meta.tokens       
         rope_positions = input_meta.offsets[:, None]
         Qh, Kh, Vh = self.attention_prologue(x, rope_positions)
-
-        page_indexes = []
-        for idx in range(0, batch_size):
-            request_slot = int(request_slots[idx].item())
-            self.KV_cache.append_decode(request_slot, Kh[idx, :, 0, :], Vh[idx, :, 0, :], tokens[idx])
-            page_indexes.append(self.KV_cache.get_indexes(request_slot))
+        self._write_decode_kv(input_meta, Kh, Vh, batch_size)
 
         token_counts = input_meta.offsets + 1
         out = torch.zeros(
@@ -199,15 +203,10 @@ class MultiQueryAttention:
                 )
 
         if x.device.type == "cuda":
-            page_index_tensors = [
-                torch.tensor(indexes, dtype=torch.int32, device=x.device)
-                for indexes in page_indexes
-            ]
-            padded_indexes = pad_sequence(page_index_tensors, batch_first=True, padding_value=-1)
             paged_mqa_decode(
                 q=Qh, K_cache=self.KV_cache.K, V_cache=self.KV_cache.V, out=out,
-                page_indexes = padded_indexes,
-                page_index_stride = padded_indexes.stride(0),
+                page_indexes = input_meta.page_indexes,
+                page_index_stride = input_meta.page_indexes.stride(0),
                 batch_size = batch_size,
                 tok_cnt= token_counts,
                 seq_len_per_page=self.KV_cache.block_size,
@@ -216,7 +215,7 @@ class MultiQueryAttention:
                 num_kv_heads=self.num_kv_heads,
             )
         else:
-            self._paged_decode_cpu(token_counts, page_indexes, batch_size, Qh, out)
+            self._paged_decode_cpu(token_counts, input_meta.page_indexes, batch_size, Qh, out)
         out = rearrange(out, "b h d -> b 1 (h d)")
         return self.outproj(out)
     

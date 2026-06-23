@@ -418,9 +418,9 @@ class ModelProcessor:
         for kv_cache in self.kv_caches:
             kv_cache.init_prefill(uuid, toks)
 
-    def caches_commit_prefill(self, uuid, toks):
+    def caches_commit_prefill(self, uuid):
         for kv_cache in self.kv_caches:
-            kv_cache.finish_prefill(uuid, toks)
+            kv_cache.finish_prefill(uuid)
 
     def _release_caches(self, handle_id: int):
         for cache in self.kv_caches:

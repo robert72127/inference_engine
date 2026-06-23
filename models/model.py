@@ -4,7 +4,7 @@ from dataclasses import dataclass
 import torch
 
 class PrefillStateBuff:
-    def __init__(self, batch_size: int, chunk_size: int, device: torch.device):
+    def __init__(self, batch_size: int, chunk_size: int, max_pages:int, device: torch.device):
         self.batch_size = batch_size
         self.chunk_size = chunk_size
         self.tokens = torch.empty((batch_size, chunk_size), device=device, dtype=torch.long)
@@ -13,13 +13,15 @@ class PrefillStateBuff:
         self.seq_lens = torch.empty((batch_size,), device=device, dtype=torch.int32)
         self.mask = torch.empty((batch_size, chunk_size), device=device, dtype=torch.bool)
         self.last_chunk = torch.empty((batch_size, chunk_size), device=device, dtype=torch.bool)
+        self.page_indexes = torch.empty((batch_size, max_pages), device=device, dtype=torch.int32)
 
 class DecodeStateBuff:
-    def __init__(self, batch_size: int, device: torch.device):
+    def __init__(self, batch_size: int, max_pages:int, device: torch.device):
         self.batch_size = batch_size
         self.tokens = torch.empty((batch_size, 1), device=device, dtype=torch.long)
         self.request_slots = torch.empty((batch_size,), device=device, dtype=torch.int32)
         self.offsets = torch.empty((batch_size,), device=device, dtype=torch.int32)
+        self.page_indexes = torch.empty((batch_size, max_pages), device=device, dtype=torch.int32)
 
 class Model(ABC):
     def __init__(self, device: torch.device):
