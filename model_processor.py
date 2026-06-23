@@ -10,7 +10,6 @@ import msgpack
 import torch
 import zmq
 import zmq.asyncio
-from torch.nn.utils.rnn import pad_sequence
 
 from models.model import PrefillStateBuff, DecodeStateBuff
 from sampling import top_k_top_p_sample
@@ -175,13 +174,21 @@ class ModelProcessor:
         self.supported_batch_sizes = [2**i for i in range(max_batch_size.bit_length()) if 2**i <= max_batch_size]
         self.prefill_chunk_size = prefill_chunk_size
 
+        block_size = self.kv_caches[0].block_size
+        max_pages_per_req = blocks_for_tokens(max_request_len, block_size)
+
         #prepare buffers for supported batch sizes
-        self.prefill_buffs = {batch_size : 
-                        PrefillStateBuff(
-                            batch_size=batch_size,
-                            chunk_size=self.prefill_chunk_size,
-                            device=self.device) for batch_size in self.supported_batch_sizes}
-        self.decode_buffs = {batch_size: DecodeStateBuff(batch_size=batch_size, device=self.device) for batch_size in self.supported_batch_sizes}
+        self.prefill_buffs = {batch_size : PrefillStateBuff(
+            batch_size=batch_size,
+            chunk_size=self.prefill_chunk_size,
+            max_pages=max_pages_per_req,
+            device=self.device)
+                for batch_size in self.supported_batch_sizes}
+        self.decode_buffs = {batch_size: DecodeStateBuff(
+            batch_size=batch_size,
+            max_pages=max_pages_per_req,
+            device=self.device)
+                for batch_size in self.supported_batch_sizes}
 
 
         self.lock = threading.Lock()
@@ -264,26 +271,38 @@ class ModelProcessor:
         if op == OP.PREFILL:
             buf = self.prefill_buffs[batch_size]
             last_chunk = []
+            buf.page_indexes.zero_()
             for i, handle in enumerate(batch):
                 end = min(handle.cache_pos + self.prefill_chunk_size, handle.tokens.size(0))
                 length = end - handle.cache_pos
 
+                tokens = handle.tokens[handle.cache_pos:end]
                 buf.tokens[i].zero_()
-                buf.tokens[i, :length].copy_(handle.tokens[handle.cache_pos:end])
+                buf.tokens[i, :length].copy_(tokens)
 
                 buf.request_slots[i] = handle.id
                 buf.offsets[i] = handle.cache_pos
                 buf.seq_lens[i] = length
-
                 last_chunk.append(end == handle.tokens.size(0))
+                # prepare space for k,v in each cache
+                self.caches_init_prefill(handle.id, tokens)
+                # set page indexes
+                indexes = self.kv_caches[0].get_indexes(handle.id)
+                buf.page_indexes[i, :len(indexes)] =  torch.as_tensor(indexes, dtype=torch.int32, device=self.device)
 
             return buf, last_chunk
         else:
             buf = self.decode_buffs[batch_size]
+            buf.page_indexes.zero_()
             for i, handle in enumerate(batch):
                 buf.tokens[i,0] = handle.input_token
                 buf.request_slots[i] = handle.id
                 buf.offsets[i] = handle.cache_pos
+                # prepare space for k,v in each cache
+                self.caches_insert_decode(handle.id, handle.input_token)
+                # set page indexes
+                indexes = self.kv_caches[0].get_indexes(handle.id)
+                buf.page_indexes[i, :len(indexes)] =  torch.as_tensor(indexes, dtype=torch.int32, device=self.device)
             return buf
 
     def worker_loop(self):
@@ -316,6 +335,8 @@ class ModelProcessor:
                 if op == OP.PREFILL:
                     prefill_state, last_chunk = self._make_batch(batch, op, batch_size)
                     model_out = self.model.prefill(prefill_state)
+                    for h in batch:
+                        self.caches_commit_prefill(h.id)
                     results = []
                     batch_decode = []
                     for i in range(len(last_chunk)):
@@ -388,6 +409,18 @@ class ModelProcessor:
         for b_size in self.supported_batch_sizes:
             if b_size > reqs_len: return b_size -1
         return self.supported_batch_sizes[-1]
+
+    def caches_insert_decode(self, uuid, tok):
+        for kv_cache in self.kv_caches:
+            kv_cache.append_decode(uuid, tok)
+
+    def caches_init_prefill(self, uuid, toks):
+        for kv_cache in self.kv_caches:
+            kv_cache.init_prefill(uuid, toks)
+
+    def caches_commit_prefill(self, uuid, toks):
+        for kv_cache in self.kv_caches:
+            kv_cache.finish_prefill(uuid, toks)
 
     def _release_caches(self, handle_id: int):
         for cache in self.kv_caches:

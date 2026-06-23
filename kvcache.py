@@ -163,14 +163,16 @@ class RadixKVCache:
                 self.blocks_count += 1
                 self.write_block_toks = []
 
-        def insert_single(self, tok, k,v):
+
+        def insert_single(self, tok):
             if self.write_block_occupancy == self.kv_cache.block_size:
                 self.commit_write_block()
                 self.alloc_write_block()
 
-            self.kv_cache.K[self.write_block][:, self.write_block_occupancy, :] = k 
-            self.kv_cache.V[self.write_block][:, self.write_block_occupancy, :] = v
-            self.write_block_toks.append(int(tok.item()) if torch.is_tensor(tok) else int(tok))
+            #self.kv_cache.K[self.write_block][:, self.write_block_occupancy, :] = k 
+            #self.kv_cache.V[self.write_block][:, self.write_block_occupancy, :] = v
+
+            self.write_block_toks.append(tok)
             self.write_block_occupancy+=1
 
         def insert_seq(self, toks, k, v):
@@ -299,6 +301,15 @@ class RadixKVCache:
         uuid_state = self.uuids[uuid]
         uuid_state.insert_seq(toks, k,v)
 
-    def append_decode(self, uuid, k, v, tok):        
+    # appends new token logically, actuall write of new k,v happens in kernel
+    def append_decode(self, uuid, tok):        
         uuid_state = self.uuids[uuid]
-        uuid_state.insert_single(tok, k, v)
+        uuid_state.insert_single(tok)
+
+    # happens before kernel, malloc space in last block for single extra toks
+    def init_prefill(self, uuid, tok):
+        pass
+
+    def finish_decode(self, uuid):
+        pass
+    
