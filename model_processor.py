@@ -189,7 +189,11 @@ class ModelProcessor:
             max_pages=max_pages_per_req,
             device=self.device)
                 for batch_size in self.supported_batch_sizes}
+        self.decode_graphs: dict[int, torch.cuda.CUDAGraph] = {}
+        self.decode_graph_outputs: dict[int, torch.Tensor] = {}
 
+        self.prefill_graphs: dict[int, torch.cuda.CUDAGraph] = {}
+        self.prefill_graph_outputs: dict[int, torch.Tensor] = {}
 
         self.lock = threading.Lock()
         self.cv = threading.Condition(self.lock)
@@ -267,7 +271,91 @@ class ModelProcessor:
                     self._release_caches(handle.id)
             self.cv.notify()
 
-    def _make_batch(self, batch: list[ServerHandle], op: OP, batch_size:int):
+    def worker_loop(self):
+        next_op = OP.PREFILL
+
+        while True:
+            with self.cv:
+                self.cv.wait_for(lambda: self.prefill_waiting or self.generating)
+
+                if self.prefill_waiting and (next_op == OP.PREFILL or not self.generating):
+                    available_slots = self._get_max_available_occupancy_left()
+                    if available_slots == 0:
+                        next_op = OP.GENERATE
+                        continue
+                    op = OP.PREFILL
+                    batch_size =  self._get_batch_size( min(available_slots, len(self.prefill_waiting)))
+                    batch = self.prefill_waiting[:batch_size]
+                    self.prefill_waiting = self.prefill_waiting[batch_size:]
+                else:
+                    batch_size = self._get_batch_size(len(self.generating))
+                    if batch_size == 0:
+                        next_op = OP.PREFILL
+                        continue
+                    op = OP.GENERATE
+                    batch = self.generating[:batch_size]
+
+                self.in_flight.update(handle.id for handle in batch)
+
+            with torch.inference_mode():
+                if op == OP.PREFILL:
+                    prefill_state, last_chunk = self._make_batched_input(batch, op, batch_size)
+                    model_out = self.run_prefill(prefill_state, batch_size)
+                    for h in batch: self.caches_commit_prefill(h.id)
+                    model_out = self._last_chunk(model_out)
+                    
+                    results = []
+                    batch_decode = []
+                    for last_chunk, out, handle in zip(last_chunk, model_out, batch):
+                        if last_chunk:
+                            results.append(out)
+                            batch_decode.append(handle)
+
+                    if batch_decode:
+                        results = self._decode_batch(torch.stack(results), batch_decode).tolist()
+                else:
+                    decode_state = self._make_batched_input(batch, op, batch_size)
+                    model_out = self.run_decode(decode_state, batch_size)
+                    results = self._decode_batch(model_out, batch).tolist()
+
+            with self.cv:
+                result_idx = 0
+                for batch_idx, handle in enumerate(batch):
+                    self.in_flight.discard(handle.id)
+                    released =  handle.id not in self.handles
+                    if op == OP.PREFILL:
+                        seq_len = prefill_state.seq_lens[batch_idx]
+                        handle.cache_pos += seq_len
+                        if not last_chunk[batch_idx]:
+                            if not released:
+                                self.prefill_waiting.append(handle)
+                            continue
+                        
+                        tok = results[result_idx]
+                        result_idx += 1
+                    else:
+                        tok = results[batch_idx]
+                        handle.cache_pos += 1
+                    
+                    handle.generated_tokens += 1
+                    handle.input_token = tok
+                    reached_limit = (
+                        handle.cache_pos >= self.max_request_len
+                        or handle.generated_tokens >= handle.max_new_tokens
+                    )
+                    if tok == self.eos_token_id or released or reached_limit:
+                        handle.finished = True
+                        self.generating = [h for h in self.generating if h.id != handle.id]
+                        self.handles.pop(handle.id, None)
+                        self._release_caches(handle.id)
+                    elif op == OP.PREFILL:
+                        self.generating.append(handle)
+
+                    if not released:
+                        handle.token_q.put_nowait(tok)
+                next_op = OP.GENERATE if op == OP.PREFILL else OP.PREFILL
+
+    def _make_batched_input(self, batch: list[ServerHandle], op: OP, batch_size:int):
         if op == OP.PREFILL:
             buf = self.prefill_buffs[batch_size]
             last_chunk = []
@@ -305,85 +393,6 @@ class ModelProcessor:
                 buf.page_indexes[i, :len(indexes)] =  torch.as_tensor(indexes, dtype=torch.int32, device=self.device)
             return buf
 
-    def worker_loop(self):
-        next_op = OP.PREFILL
-
-        while True:
-            with self.cv:
-                self.cv.wait_for(lambda: self.prefill_waiting or self.generating)
-
-                if self.prefill_waiting and (next_op == OP.PREFILL or not self.generating):
-                    available_slots = self._get_max_available_occupancy_left()
-                    if available_slots == 0:
-                        next_op = OP.GENERATE
-                        continue
-                    op = OP.PREFILL
-                    batch_size =  self._get_batch_size( min(available_slots, len(self.prefill_waiting)))
-                    batch = self.prefill_waiting[:batch_size]
-                    self.prefill_waiting = self.prefill_waiting[batch_size:]
-                else:
-                    batch_size = self._get_batch_size(len(self.generating))
-                    if batch_size == 0:
-                        next_op = OP.PREFILL
-                        continue
-                    op = OP.GENERATE
-                    batch = self.generating[:batch_size]
-
-                self.in_flight.update(handle.id for handle in batch)
-
-            with torch.inference_mode():
-                if op == OP.PREFILL:
-                    prefill_state, last_chunk = self._make_batch(batch, op, batch_size)
-                    model_out = self.model.prefill(prefill_state)
-                    for h in batch:
-                        self.caches_commit_prefill(h.id)
-                    results = []
-                    batch_decode = []
-                    for i in range(len(last_chunk)):
-                        if last_chunk[i]:
-                            results.append(model_out[i])
-                            batch_decode.append(batch[i])
-                    if batch_decode:
-                        results = self._decode_batch(torch.stack(results), batch_decode).tolist()
-                else:
-                    decode_state = self._make_batch(batch, op, batch_size)
-                    model_out = self.model.decode(decode_state)
-                    results = self._decode_batch(model_out, batch).tolist()
-
-            with self.cv:
-                result_idx = 0
-                for batch_idx, handle in enumerate(batch):
-                    self.in_flight.discard(handle.id)
-                    released =  handle.id not in self.handles
-                    if op == OP.PREFILL:
-                        seq_len = prefill_state.seq_lens[batch_idx]
-                        handle.cache_pos += seq_len
-                        if not last_chunk[batch_idx]:
-                            if not released:
-                                self.prefill_waiting.append(handle)
-                            continue
-                        tok = results[result_idx]
-                        result_idx += 1
-                    else:
-                        tok = results[batch_idx]
-                        handle.cache_pos += 1
-                        handle.generated_tokens += 1
-                    handle.input_token = tok
-                    reached_limit = (
-                        handle.cache_pos >= self.max_request_len
-                        or handle.generated_tokens >= handle.max_new_tokens
-                    )
-                    if tok == self.eos_token_id or released or reached_limit:
-                        handle.finished = True
-                        self.generating = [h for h in self.generating if h.id != handle.id]
-                        self.handles.pop(handle.id, None)
-                        self._release_caches(handle.id)
-                    elif op == OP.PREFILL:
-                        self.generating.append(handle)
-
-                    if not released:
-                        handle.token_q.put_nowait(tok)
-                next_op = OP.GENERATE if op == OP.PREFILL else OP.PREFILL
 
     def _decode_batch(self, logits: torch.Tensor, batch: list[ServerHandle]) -> torch.Tensor:
         tokens = []
@@ -399,6 +408,45 @@ class ModelProcessor:
                 ).squeeze(0)
             tokens.append(token)
         return torch.stack(tokens)
+
+    def run_decode(self, decode_state: DecodeStateBuff, batch_size: int) -> torch.Tensor:
+        return self._run_model(decode_state, batch_size,
+                               graphs=self.decode_graphs,
+                               graph_outputs=self.decode_graph_outputs,
+                               process=self.model.decode)
+
+
+    def run_prefill(self, prefill_state: DecodeStateBuff, batch_size: int) -> torch.Tensor:
+        return self._run_model(prefill_state, batch_size,
+                               graphs=self.prefill_graphs,
+                               graph_outputs=self.prefill_graph_outputs,
+                               process=self.model.prefill)
+
+
+    def _run_model(self, state, batch_size:int, graphs, graph_outputs, process) -> torch.Tensor:
+        if self.device.type != "cuda":
+            return process(state)
+        
+        graph = graphs.get(batch_size)
+        if graph is not None:
+            graph.replay()
+            return graph_outputs[batch_size]
+
+        with torch.cuda.device(self.device):
+            warmup_stream = torch.cuda.Stream()
+            warmup_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(warmup_stream):
+                for _ in range(3):
+                    process(state)
+            torch.cuda.current_stream().wait_stream(warmup_stream)
+
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                static_out = process(state)
+
+        graphs[batch_size] = graph
+        graph_outputs[batch_size] = static_out
+        return static_out
 
     def _get_max_available_occupancy_left(self):
         max_blocks_per_request = blocks_for_tokens(self.max_request_len, self.kv_caches[0].block_size)

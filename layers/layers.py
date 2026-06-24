@@ -3,7 +3,11 @@ import torch
 import math
 
 from kvcache import RadixKVCache
-from layers.triton_kernels import paged_mqa_decode, residual_rms
+from layers.triton_kernels import (
+    paged_mqa_decode, 
+    write_mqa_decode_kv, write_mqa_prefill_kv, 
+    residual_rms)
+
 from models.model import PrefillStateBuff, DecodeStateBuff
 
 class Embedding:
@@ -141,6 +145,23 @@ class MultiQueryAttention:
 
     def _write_prefill_kv(self, input_meta: PrefillStateBuff, Kh: torch.Tensor, Vh: torch.Tensor, batch_size: int):
         block_size = self.KV_cache.block_size
+        
+        if Kh.device.type == "cuda":
+            write_mqa_prefill_kv(
+                K_cache=self.KV_cache.K,
+                V_cache=self.KV_cache.V,
+                Kh=Kh,
+                Vh=Vh,
+                page_indexes=input_meta.page_indexes,
+                page_index_stride=input_meta.page_indexes.stride(0),
+                offsets=input_meta.offsets,
+                batch_size=batch_size,
+                seq_len_per_page=block_size,
+                d_head=self.head_dim,
+                num_kv_heads=self.num_kv_heads,
+            )
+            return
+        
         for idx in range(batch_size):
             offset = int(input_meta.offsets[idx].item())
             seq_len = int(input_meta.seq_lens[idx].item())
@@ -157,12 +178,29 @@ class MultiQueryAttention:
 
     def _write_decode_kv(self, input_meta: DecodeStateBuff, Kh: torch.Tensor, Vh: torch.Tensor, batch_size: int):
         block_size = self.KV_cache.block_size
-        page_slots = torch.div(input_meta.offsets, block_size, rounding_mode="floor")
-        page_offsets = input_meta.offsets % block_size
+        if Kh.device.type == "cuda":
+            write_mqa_decode_kv(
+                K_cache=self.KV_cache.K,
+                V_cache=self.KV_cache.V,
+                Kh=Kh,
+                Vh=Vh,
+                page_indexes=input_meta.page_indexes,
+                page_index_stride=input_meta.page_indexes.stride(0),
+                offsets=input_meta.offsets,
+                batch_size=batch_size,
+                seq_len_per_page=block_size,
+                d_head=self.head_dim,
+                num_kv_heads=self.num_kv_heads,
+            )
+            return
+
         for idx in range(batch_size):
-            page_idx = input_meta.page_indexes[idx, page_slots[idx]]
-            self.KV_cache.K[page_idx, :, page_offsets[idx], :] = Kh[idx, :, 0, :]
-            self.KV_cache.V[page_idx, :, page_offsets[idx], :] = Vh[idx, :, 0, :]
+            offset = int(input_meta.offsets[idx].item())
+            page_slot = offset // block_size
+            page_offset = offset % block_size
+            page_idx = input_meta.page_indexes[idx, page_slot]
+            self.KV_cache.K[page_idx, :, page_offset, :] = Kh[idx, :, 0, :]
+            self.KV_cache.V[page_idx, :, page_offset, :] = Vh[idx, :, 0, :]
 
     def prefill(self, x, input_meta:PrefillStateBuff):
         batch_size = x.size(0)
