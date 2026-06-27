@@ -157,6 +157,7 @@ class MultiQueryAttention:
                 offsets=input_meta.offsets,
                 batch_size=batch_size,
                 seq_len_per_page=block_size,
+                chunk_size=input_meta.chunk_size,
                 d_head=self.head_dim,
                 num_kv_heads=self.num_kv_heads,
             )

@@ -3,6 +3,114 @@ import triton.language as tl
 import torch
 
 
+def write_mqa_decode_kv(
+            K_cache, V_cache, Kh, Vh,
+            page_indexes,
+            page_index_stride,
+            offsets,
+            batch_size,
+            seq_len_per_page,
+            d_head,
+            num_kv_heads,
+        ):
+    grid = (batch_size, num_kv_heads)
+    write_mqa_decode_kv_kernel[grid](
+        K_cache, V_cache, Kh, Vh,
+        page_indexes, offsets,
+        page_index_stride,
+        seq_len_per_page,
+        d_head=d_head,
+        num_kv_heads=num_kv_heads,
+        BLOCK_D=triton.next_power_of_2(d_head),
+    )
+
+@triton.jit
+def write_mqa_decode_kv_kernel(
+    K_cache, V_cache, Kh, Vh,
+    page_indexes, offsets,
+    page_index_stride,
+    seq_len_per_page: tl.constexpr,
+    d_head: tl.constexpr,
+    num_kv_heads: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    batch_idx = tl.program_id(0)
+    kv_head_idx = tl.program_id(1)
+    offs_d = tl.arange(0, BLOCK_D)
+    mask = offs_d < d_head
+
+    offset = tl.load(offsets + batch_idx)
+    page_slot = offset // seq_len_per_page
+    page_offset = offset - page_slot * seq_len_per_page
+    page_idx = tl.load(page_indexes + batch_idx * page_index_stride + page_slot)
+
+    src_base = ((batch_idx * num_kv_heads + kv_head_idx) * d_head)
+    dst_base = (((page_idx * num_kv_heads + kv_head_idx) * seq_len_per_page + page_offset) * d_head)
+
+    k = tl.load(Kh + src_base + offs_d, mask=mask, other=0.0)
+    v = tl.load(Vh + src_base + offs_d, mask=mask, other=0.0)
+    tl.store(K_cache + dst_base + offs_d, k, mask=mask)
+    tl.store(V_cache + dst_base + offs_d, v, mask=mask)
+
+
+def write_mqa_prefill_kv(
+        K_cache, V_cache, Kh, Vh,
+        page_indexes,
+        page_index_stride,
+        offsets,
+        batch_size,
+        seq_len_per_page,
+        chunk_size,
+        d_head,
+        num_kv_heads
+):   
+
+    grid = (batch_size, num_kv_heads, chunk_size)
+    write_mqa_prefill_kv_kernel[grid](
+        K_cache, V_cache, Kh, Vh,
+        page_indexes, offsets, 
+        page_index_stride,
+        seq_len_per_page,
+        chunk_size=chunk_size,
+        d_head=d_head,
+        num_kv_heads=num_kv_heads,
+        BLOCK_D=triton.next_power_of_2(d_head),
+    )
+
+@triton.jit
+def write_mqa_prefill_kv_kernel(
+    K_cache, V_cache, Kh, Vh,
+    page_indexes, offsets,
+    page_index_stride,
+    seq_len_per_page: tl.constexpr,
+    chunk_size: tl.constexpr,
+    d_head: tl.constexpr,
+    num_kv_heads: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    batch_idx = tl.program_id(0)
+    kv_head_idx = tl.program_id(1)
+    token_idx = tl.program_id(2)
+
+    offs_d = tl.arange(0, BLOCK_D)
+    mask_head = offs_d < d_head
+
+    offset = tl.load(offsets + batch_idx) + token_idx
+    page_slot = offset // seq_len_per_page
+    page_offset = offset - page_slot * seq_len_per_page
+    page_idx = tl.load(page_indexes + batch_idx * page_index_stride + page_slot)
+
+    mask_page_present = page_idx != -1
+    load_store_mask = mask_page_present & mask_head
+
+    src_base = (((batch_idx * num_kv_heads + kv_head_idx) * chunk_size + token_idx) * d_head)
+    dst_base = (((page_idx * num_kv_heads + kv_head_idx) * seq_len_per_page + page_offset) * d_head)
+
+    k = tl.load(Kh + src_base + offs_d, mask=load_store_mask, other=0.0)
+    v = tl.load(Vh + src_base + offs_d, mask=load_store_mask, other=0.0)
+    tl.store(K_cache + dst_base + offs_d, k, mask=load_store_mask)
+    tl.store(V_cache + dst_base + offs_d, v, mask=load_store_mask)
+
 def paged_mqa_decode(
             q, K_cache, V_cache, out, 
             page_indexes,

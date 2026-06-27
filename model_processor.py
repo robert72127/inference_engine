@@ -359,7 +359,8 @@ class ModelProcessor:
         if op == OP.PREFILL:
             buf = self.prefill_buffs[batch_size]
             last_chunk = []
-            buf.page_indexes.zero_()
+            # todo needs fix, maybe -1? cause zero is valid page index
+            buf.page_indexes.fill_(-1)
             for i, handle in enumerate(batch):
                 end = min(handle.cache_pos + self.prefill_chunk_size, handle.tokens.size(0))
                 length = end - handle.cache_pos
@@ -381,7 +382,7 @@ class ModelProcessor:
             return buf, last_chunk
         else:
             buf = self.decode_buffs[batch_size]
-            buf.page_indexes.zero_()
+            buf.page_indexes.fill_(-1)
             for i, handle in enumerate(batch):
                 buf.tokens[i,0] = handle.input_token
                 buf.request_slots[i] = handle.id
