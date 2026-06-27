@@ -4,7 +4,7 @@ import math
 
 from kvcache import RadixKVCache
 from layers.triton_kernels import (
-    paged_mqa_decode, 
+    paged_mqa_decode, paged_mqa_prefill, 
     write_mqa_decode_kv, write_mqa_prefill_kv, 
     residual_rms)
 
@@ -72,13 +72,6 @@ class RoPe:
         # x: [B, H, L, D]
         B, H, L, D = x.shape
         half = D // 2
-        if position is None:
-            position = torch.arange(L, device=x.device).unsqueeze(0).expand(B, -1)
-        else:
-            position = torch.as_tensor(position, device=x.device)
-            if position.shape != (B, L):
-                raise ValueError(f"Unsupported RoPE position shape {tuple(position.shape)} for x shape {tuple(x.shape)}")
-
         cos = self.cos[position].to(x.device)[:, None, :, :]
         sin = self.sin[position].to(x.device)[:, None, :, :]
 
@@ -140,7 +133,10 @@ class MultiQueryAttention:
             Qh = self.rope(Qh, position=rope_positions)
             Kh = self.rope(Kh, position=rope_positions)
 
-        return Qh, Kh, Vh
+        # The Triton kernels use flat pointer arithmetic for [B, H, L, D].
+        # rearrange() returns a strided view, and Vh remains strided because it
+        # does not pass through RoPE's concatenation.
+        return Qh.contiguous(), Kh.contiguous(), Vh.contiguous()
 
 
     def _write_prefill_kv(self, input_meta: PrefillStateBuff, Kh: torch.Tensor, Vh: torch.Tensor, batch_size: int):
@@ -155,6 +151,7 @@ class MultiQueryAttention:
                 page_indexes=input_meta.page_indexes,
                 page_index_stride=input_meta.page_indexes.stride(0),
                 offsets=input_meta.offsets,
+                seq_lens=input_meta.seq_lens,
                 batch_size=batch_size,
                 seq_len_per_page=block_size,
                 chunk_size=input_meta.chunk_size,
@@ -205,10 +202,10 @@ class MultiQueryAttention:
 
     def prefill(self, x, input_meta:PrefillStateBuff):
         batch_size = x.size(0)
-        seq_len = int(input_meta.seq_lens[0].item())
-        x = x[:, :seq_len, :]
+        seq_len = x.size(1)
         positions = torch.arange(seq_len, dtype=torch.int32, device=x.device)
         rope_positions = input_meta.offsets[:, None] + positions[None, :]
+        rope_positions = rope_positions.clamp_max(self.max_seq_len - 1)
         
         Qh, Kh, Vh = self.attention_prologue(x, rope_positions)
         self._write_prefill_kv(input_meta, Kh, Vh, batch_size)
@@ -221,10 +218,26 @@ class MultiQueryAttention:
             dtype=x.dtype,
             device=x.device,
         )
-        self._paged_prefill_cpu(input_meta.offsets, input_meta.seq_lens, input_meta.page_indexes, batch_size, Qh, out)
+
+        if x.device.type == "cuda":
+            paged_mqa_prefill(
+                q=Qh, K_cache=self.KV_cache.K, V_cache=self.KV_cache.V, out=out,
+                page_indexes = input_meta.page_indexes,
+                page_index_stride = input_meta.page_indexes.stride(0),
+                batch_size = batch_size,
+                offsets = input_meta.offsets,
+                seq_lens = input_meta.seq_lens,
+                chunk_size = input_meta.chunk_size,
+                seq_len_per_page=self.KV_cache.block_size,
+                d_head=self.head_dim,
+                num_attn_heads=self.num_attn_heads,
+                num_kv_heads=self.num_kv_heads,
+            )
+ 
+        else:
+            self._paged_prefill_cpu(input_meta.offsets, input_meta.seq_lens, input_meta.page_indexes, batch_size, Qh, out)
         out = rearrange(out, "b h l d -> b l (h d)")
         return self.outproj(out)
-
 
     def decode(self, x:torch.Tensor, input_meta:DecodeStateBuff):
         batch_size = x.shape[0]
@@ -356,10 +369,6 @@ class TransformerBlock:
         return x + self.mlp(mlp_in)
 
     def prefill(self, x, input_meta:PrefillStateBuff):
-        seq_len = int(input_meta.seq_lens[0].item())
-        x = x[:, :seq_len, :]
         attn_in = self.pre_norm(x)
         x, mlp_in = self.residual_rms(x, self.attention.prefill(attn_in, input_meta))
         return x + self.mlp(mlp_in)
-
-

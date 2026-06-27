@@ -302,12 +302,11 @@ class ModelProcessor:
                     prefill_state, last_chunk = self._make_batched_input(batch, op, batch_size)
                     model_out = self.run_prefill(prefill_state, batch_size)
                     for h in batch: self.caches_commit_prefill(h.id)
-                    model_out = self._last_chunk(model_out)
                     
                     results = []
                     batch_decode = []
-                    for last_chunk, out, handle in zip(last_chunk, model_out, batch):
-                        if last_chunk:
+                    for is_last_chunk, out, handle in zip(last_chunk, model_out, batch):
+                        if is_last_chunk:
                             results.append(out)
                             batch_decode.append(handle)
 
@@ -324,7 +323,7 @@ class ModelProcessor:
                     self.in_flight.discard(handle.id)
                     released =  handle.id not in self.handles
                     if op == OP.PREFILL:
-                        seq_len = prefill_state.seq_lens[batch_idx]
+                        seq_len = int(prefill_state.seq_lens[batch_idx].item())
                         handle.cache_pos += seq_len
                         if not last_chunk[batch_idx]:
                             if not released:
@@ -455,9 +454,7 @@ class ModelProcessor:
 
     def _get_batch_size(self, reqs_len):
         if reqs_len == 0: return 0
-        for b_size in self.supported_batch_sizes:
-            if b_size > reqs_len: return b_size -1
-        return self.supported_batch_sizes[-1]
+        return max(b_size for b_size in self.supported_batch_sizes if b_size <= reqs_len)
 
     def caches_insert_decode(self, uuid, tok):
         for kv_cache in self.kv_caches:
