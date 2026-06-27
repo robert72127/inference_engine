@@ -7,64 +7,82 @@ def blocks_for_tokens(token_count: int, block_size: int):
         blocks_cnt += 1
     return blocks_cnt
 
-class RadixTree:
-    def __init__(self, kv_cache):
-        self.root = self.RadixNode(page_id=None, key=None)
+class PrefixBlockTrie:
+    class Node:
+        def __init__(self, page_id=None, key=None, parent=None):
+            self.page_id = page_id
+            self.key = key
+            self.parent = parent
+            self.children = {}
+
+    def __init__(self):
+        self.root = self.Node()
         self.uuid_to_last_node = {}
 
-    def get_last_node(self, uuid):
-        return self.uuid_to_last_node[uuid]
-
-    def add_node(self, uuid, node):
+    def set_last_node(self, uuid, node):
         self.uuid_to_last_node[uuid] = node
+
+    def get_last_node(self, uuid):
+        return self.uuid_to_last_node.get(uuid, self.root)
 
     def remove_uuid(self, uuid):
         self.uuid_to_last_node.pop(uuid, None)
 
-    def remove_node(self, node):
-        if node == self.root:
-            return
-        for uuid, last_node in list(self.uuid_to_last_node.items()):
-            current = last_node
-            while current is not None:
-                if current is node:
-                    self.uuid_to_last_node[uuid] = self.root
+    def search(self, block_keys):
+        node = self.root
+        nodes = []
+
+        for key in block_keys:
+            key = tuple(key)
+            child = node.children.get(key)
+            if child is None:
+                break
+            nodes.append(child)
+            node = child
+
+        return nodes
+
+    def insert_after_uuid(self, uuid, page_id, key):
+        parent = self.get_last_node(uuid)
+        key = tuple(key)
+
+        child = parent.children.get(key)
+        if child is None:
+            child = self.Node(page_id=page_id, key=key, parent=parent)
+            parent.children[key] = child
+
+        self.uuid_to_last_node[uuid] = child
+        return child
+
+    def remove_subtree(self, node):
+        if node is self.root:
+            return []
+
+        removed = []
+        stack = [node]
+        removed_set = set()
+
+        while stack:
+            n = stack.pop()
+            removed.append(n)
+            removed_set.add(n)
+            stack.extend(n.children.values())
+
+        fallback = node.parent or self.root
+
+        for uuid, last in list(self.uuid_to_last_node.items()):
+            cur = last
+            while cur is not None:
+                if cur in removed_set:
+                    self.uuid_to_last_node[uuid] = fallback
                     break
-                current = current.parent
-        for child in list(node.children):
-            self.remove_node(child)
-        if node.parent:
-            node.parent.children = [child for child in node.parent.children if child is not node]
+                cur = cur.parent
 
-    def insert(self, uuid, block_idx, key):
-        node = self.get_last_node(uuid)
-        for child in node.children:
-            if child.key == key:
-                self.uuid_to_last_node[uuid] = child
-                return child
-        new_node = self.RadixNode(page_id=block_idx, key=key)
-        new_node.parent = node
-        node.children.append(new_node)
-        self.uuid_to_last_node[uuid] = new_node
-        return new_node
-        
-    def search(self, toks):
-        return self.root.search(toks, [])
-    
-    class RadixNode:
-        def __init__(self, page_id, key):
-            self.key=key
-            self.page_id = page_id
-            self.parent = None
-            self.children = []
+        if node.parent is not None:
+            node.parent.children.pop(node.key, None)
 
-        def search(self, key_lst, nodes_list):
-            if not key_lst:
-                return nodes_list
-            for child in self.children:
-                if child.key == key_lst[0]:
-                    return child.search(key_lst[1:], nodes_list + [child])
-            return nodes_list
+        return removed
+
 
 class BlockAllocator:
     def __init__(self, num_blocks):
@@ -117,60 +135,84 @@ class RadixKVCache:
             self.kv_cache = kv_cache
             self.block_size = block_size
             self.commited_blocks = commited_blocks
+            self.blocks_count = blocks_count
 
             self.write_block = None
             self.write_block_toks = []
-
-            self.blocks_count = blocks_count
             self.write_block_occupancy = 0
+            self.pending_full_blocks = []
 
-        def get_pages_info(self):
-            seq_len = self.block_size * len(self.commited_blocks) + self.write_block_occupancy
-            indexes = list(self.commited_blocks)
+        def get_indexes_and_occupancy(self):
+            indexes = list(self.commited_blocks) # list so we dont accidentaly modify state
+            indexes.extend(block for block, _ in self.pending_full_blocks)
+            last_block_occp = self.block_size
             if self.write_block is not None:
                 indexes.append(self.write_block)
-            return {
-                "indexes": indexes,
-                "token_count":seq_len
-            }
+                last_block_occp = self.write_block_occupancy
+            return indexes, last_block_occp
 
-        def insert_prefill(self, commited_blocks, write_block, write_block_occupancy, write_block_toks):
-            self.commited_blocks += commited_blocks
-            self.write_block = write_block
-            self.write_block_occupancy = write_block_occupancy
-            self.write_block_toks = write_block_toks
-            self.blocks_count += len(commited_blocks) + 1
+        def commit_block(self, block, toks):
+            block = self.kv_cache.trie_insert(self.uuid, block, toks)
+            self.commited_blocks.append(block)
+            return block
 
-        def insert_single(self, tok, K,V):
+        def commit_write_block(self):
+            self.commit_block(self.write_block, self.write_block_toks)
+            self.write_block = None
+            self.write_block_occupancy = 0
+            self.write_block_toks = []
+
+        def alloc_write_block(self):
+            if self.write_block is None:
+                self.write_block = self.kv_cache.allocate_blocks()[0]
+                self.write_block_occupancy = 0
+                self.blocks_count += 1
+                self.write_block_toks = []
+
+
+        def insert_single(self, tok):
+            if self.write_block is None:
+                self.alloc_write_block()
+
             if self.write_block_occupancy == self.kv_cache.block_size:
-               self.commit_write_block()
-               self.write_block = self.kv_cache.allocate_blocks()[0]
-               self.write_block_occupancy = 0
-               self.blocks_count +=1
-               self.write_block_toks = []
+                self.commit_write_block()
+                self.alloc_write_block()
 
-            self.kv_cache.K[self.write_block][:, self.write_block_occupancy, :] = K 
-            self.kv_cache.V[self.write_block][:, self.write_block_occupancy, :] = V 
             self.write_block_toks.append(int(tok.item()) if torch.is_tensor(tok) else int(tok))
             self.write_block_occupancy+=1
 
-        def commit_write_block(self):
-            self.write_block = self.kv_cache.radix_insert(self.uuid, self.write_block, self.write_block_toks)
-            self.commited_blocks.append(self.write_block)
-            self.write_block = None
-            self.write_block_occupancy = 0
-            self.write_block_toks = []
+        def reserve_seq(self, toks):
+            toks_list = [int(tok) for tok in toks.detach().cpu().tolist()]
+            src_start = 0
+            remaining_tokens = len(toks_list)
+            while remaining_tokens > 0:
+                if self.write_block is None:
+                    self.alloc_write_block()
 
-        def append_chunk_tokens(self, toks, K, V, src_idx, token_count):
-            dst_start = self.write_block_occupancy
-            dst_end = dst_start + token_count
-            src_end = src_idx + token_count
+                if self.write_block_occupancy == self.kv_cache.block_size:
+                    self.pending_full_blocks.append((self.write_block, self.write_block_toks))
+                    self.write_block = None
+                    self.write_block_occupancy = 0
+                    self.write_block_toks = []
+                    self.alloc_write_block()
 
-            self.kv_cache.K[self.write_block][:, dst_start:dst_end, :] = K[:, src_idx:src_end, :]
-            self.kv_cache.V[self.write_block][:, dst_start:dst_end, :] = V[:, src_idx:src_end, :]
-            self.write_block_toks.extend(int(tok) for tok in toks[src_idx:src_end].detach().cpu().tolist())
-            self.write_block_occupancy = dst_end
-            return src_end
+                fill_tokens = min(remaining_tokens, self.block_size - self.write_block_occupancy)
+                dst_end = self.write_block_occupancy + fill_tokens
+                src_end = src_start + fill_tokens
+
+                self.write_block_toks.extend(toks_list[src_start:src_end])
+                self.write_block_occupancy = dst_end
+
+                src_start += fill_tokens
+                remaining_tokens -= fill_tokens
+
+        def commit_pending_prefill(self):
+            for block, toks in self.pending_full_blocks:
+                self.commit_block(block, toks)
+            self.pending_full_blocks = []
+
+            if self.write_block is not None and self.write_block_occupancy == self.kv_cache.block_size:
+                self.commit_write_block()
 
     def __init__(self, d_head, head_cnt, num_blocks, block_size, max_requests_per_uuid=None, device=None, dtype=None):
         self.d_head = d_head
@@ -191,69 +233,59 @@ class RadixKVCache:
         self.K = torch.zeros((num_blocks,self.head_cnt, block_size, self.d_head), device=device, dtype=dtype)
         self.V = torch.zeros((num_blocks,self.head_cnt, block_size, self.d_head), device=device, dtype=dtype)
 
-        self.radix_tree = RadixTree(self)
+        self.prefix_trie = PrefixBlockTrie()
 
     # might return different index if block is already present, then this block will be auto freed, and found block lock_count will be incremented
-    def radix_insert(self, uuid, block_idx, toks):
-        new_node = self.radix_tree.insert(uuid, block_idx, toks) 
+    def trie_insert(self, uuid, block_idx, toks):
+        new_node = self.prefix_trie.insert_after_uuid(uuid, block_idx, toks) 
         new_block_idx = new_node.page_id
         self.block_to_node[new_block_idx] = new_node
+        
         if new_block_idx != block_idx:
             self.block_allocator.free_blocks([block_idx])
+            self.block_allocator.incr_lock_count([new_block_idx])
+        
         return new_block_idx
 
     # returns longest list of pages that match prefix, update locked_slots if found pages
-    def radix_search(self, uuid, toks):
-        nodes = self.radix_tree.search(toks)
+    def trie_search(self, uuid, toks):
+        nodes = self.prefix_trie.search(toks)
         pages = [node.page_id for node in nodes]
         self.block_allocator.incr_lock_count(pages)
-        self.radix_tree.add_node(uuid, nodes[-1] if nodes else self.radix_tree.root)
+        self.prefix_trie.set_last_node(uuid, nodes[-1] if nodes else self.prefix_trie.root)
         return pages, len(nodes)
 
-    def _release(self, uuid):
+    def release(self, uuid):
         uuid_state = self.uuids.pop(uuid, None)
         if uuid_state is None:
-            self.radix_tree.remove_uuid(uuid)
+            self.prefix_trie.remove_uuid(uuid)
             return
-        self.radix_tree.remove_uuid(uuid)
+        self.prefix_trie.remove_uuid(uuid)
 
-        blocks = uuid_state.commited_blocks + [uuid_state.write_block]
+        blocks = uuid_state.commited_blocks + [block for block, _ in uuid_state.pending_full_blocks] + [uuid_state.write_block]
         self.block_allocator.free_blocks(blocks)
-
-    def release(self, uuids):
-        for uuid in uuids:
-            self._release(uuid)
 
     def allocate_blocks(self, block_cnt=1):
         blocks = self.block_allocator.get_free_blocks(block_cnt)
-        # if they were in tree remove from tree
+        # if they were in tree remove them
         for block in blocks:
             if block in self.block_to_node:
                 node = self.block_to_node.pop(block)
-                self._drop_subtree_refs([node])
-                self.radix_tree.remove_node(node)
+                removed_nodes = self.prefix_trie.remove_subtree(node)
+                for n in removed_nodes:
+                    self.block_to_node.pop(n.page_id, None)
         self.block_allocator.incr_lock_count(blocks)
         return blocks
-
-    def _drop_subtree_refs(self, nodes):
-        stack = list(nodes)
-        while stack:
-            node = stack.pop()
-            stack.extend(node.children)
-            self.block_to_node.pop(node.page_id, None)
 
     def get_pages(self, indexes):
         K_ = [self.K[ind] for ind in indexes]
         V_ = [self.V[ind] for ind in indexes]
         return K_, V_
 
-    def get_pages_info(self, uuids):
-        return [self.uuids[uuid].get_pages_info() for uuid in uuids]
-
-    def get_prefill_chunk_info(self, uuid, chunk_start, chunk_len):
-        pages_info = self.uuids[uuid].get_pages_info()
-        cached_chunk_tokens = max(0, min(pages_info["token_count"], chunk_start + chunk_len) - chunk_start)
-        return pages_info, cached_chunk_tokens
+    def get_indexes(self, uuid):
+        uuid_state = self.uuids[uuid]
+        indexes, _ = uuid_state.get_indexes_and_occupancy()
+        return indexes
 
     def get_blocks_available(self):
         reserved = 0
@@ -261,63 +293,33 @@ class RadixKVCache:
             reserved += self.max_requests_per_uuid - uuid_state.blocks_count
         return self.block_allocator.free_slots_cnt + len(self.block_allocator.evictable_blocks) - reserved
 
-    def _block_keys_for_tokens(self, toks):
+    def tokens_to_blocks(self, toks):
         return [
             toks[i:i + self.block_size]
             for i in range(0, len(toks) - len(toks) % self.block_size, self.block_size)
         ]
 
-    def get_q_position(self, uuids):
-        positions = []
-        for uuid in uuids:
-            uuid_state = self.uuids[uuid]
-            positions.append((uuid_state.blocks_count -1) * self.block_size + uuid_state.write_block_occupancy)
-        return torch.tensor(positions, device=self.K.device).unsqueeze(1)
-
     # first step in prefill, serach for pages matching longest prefix of toks
-    def init(self, uuids, toks):
-        for i, uuid in enumerate(uuids):
-            blocks, blocks_cnt = self.radix_search(uuid, self._block_keys_for_tokens(toks[i]))
-            self.uuids[uuid] = self.UUIDState(
+    def init(self, uuid, toks):
+        blocks, blocks_cnt = self.trie_search(uuid, self.tokens_to_blocks(toks))
+        self.uuids[uuid] = self.UUIDState(
                 uuid,
                 self,
                 self.block_size,
                 blocks_count=blocks_cnt,
                 commited_blocks=blocks,
-            )
+        )
 
-    def prefill(self, uuids, toks, K, V, mask):
-        for i, uuid in enumerate(uuids):
-            uuid_state = self.uuids[uuid]
-            src_idx = 0
-            remaining_tokens = int(mask[i].sum().item())
+    # appends new token logically, actuall write of new k,v happens in kernel
+    def append_decode(self, uuid, tok):        
+        uuid_state = self.uuids[uuid]
+        uuid_state.insert_single(tok)
 
-            if uuid_state.write_block is not None:
-                fill_tokens = min(remaining_tokens, self.block_size - uuid_state.write_block_occupancy)
-                src_idx = uuid_state.append_chunk_tokens(toks[i], K[i], V[i], src_idx, fill_tokens)
-                remaining_tokens -= fill_tokens
+    # happens before kernel, malloc space in last block for single extra toks
+    def init_prefill(self, uuid, toks):
+        uuid_state = self.uuids[uuid]
+        uuid_state.reserve_seq(toks)
 
-                if uuid_state.write_block_occupancy == self.block_size:
-                    uuid_state.commit_write_block()
-
-            while remaining_tokens > 0:
-                if uuid_state.write_block is None:
-                    uuid_state.write_block = self.allocate_blocks()[0]
-                    uuid_state.write_block_occupancy = 0
-                    uuid_state.write_block_toks = []
-                    uuid_state.blocks_count += 1
-
-                fill_tokens = min(remaining_tokens, self.block_size)
-                src_idx = uuid_state.append_chunk_tokens(toks[i], K[i], V[i], src_idx, fill_tokens)
-                remaining_tokens -= fill_tokens
-
-                if uuid_state.write_block_occupancy == self.block_size:
-                    uuid_state.commit_write_block()
-
-    def append_and_fetch(self, uuids, K, V, toks):
-        pages_info = []
-        for i, uuid in enumerate(uuids):
-            uuid_state = self.uuids[uuid]
-            uuid_state.insert_single(toks[i], K[i, :, 0, :], V[i, :, 0, :])
-            pages_info.append(uuid_state.get_pages_info())
-        return pages_info
+    def finish_prefill(self, uuid):
+        uuid_state = self.uuids[uuid]
+        uuid_state.commit_pending_prefill()

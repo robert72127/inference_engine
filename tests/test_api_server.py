@@ -3,8 +3,8 @@ import unittest
 
 from fastapi import HTTPException
 
-import api_server
 from api_server import ChatCompletionRequest, ChatMessage, app, chat, validate_sampling_params
+from engine import GenDelta, GenEnd, GenStart
 from models import MODEL
 
 
@@ -23,7 +23,7 @@ class FakeEngine:
                 "top_p": top_p,
             }
         )
-        return "ok"
+        return "ok", 3, 2
 
     async def generate_stream(self, prompt, max_tokens, temperature=1.0, top_p=1.0):
         self.generate_stream_calls.append(
@@ -34,8 +34,10 @@ class FakeEngine:
                 "top_p": top_p,
             }
         )
-        for chunk in ("o", "k"):
-            yield chunk
+        yield GenStart(prompt_tokens=3)
+        yield GenDelta(text="o")
+        yield GenDelta(text="k")
+        yield GenEnd(completion_tokens=2)
 
 
 class ApiServerTests(unittest.IsolatedAsyncioTestCase):
@@ -95,6 +97,8 @@ class ApiServerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn('"content": "o"', payload)
         self.assertIn('"content": "k"', payload)
+        self.assertIn('"prompt_tokens": 3', payload)
+        self.assertIn('"completion_tokens": 2', payload)
         self.assertEqual(
             app.state.engine.generate_stream_calls,
             [

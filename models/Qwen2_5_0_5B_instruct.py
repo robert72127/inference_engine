@@ -5,7 +5,7 @@ import json
 import os
 from pathlib import Path
 
-from models.model import Model, ModelForwardState
+from models.model import Model, PrefillStateBuff, DecodeStateBuff 
 from kvcache import blocks_for_tokens
 from layers.layers import (
     Embedding,
@@ -175,7 +175,8 @@ def parse_model(
         raise RuntimeError("KV cache budget allows zero cache blocks")
 
     hidden_layers = {}
-    model = []
+    input_embed = None
+    transformer_blocks = []
     kv_caches = []
     rope_head_dim = None
 
@@ -189,7 +190,7 @@ def parse_model(
 
         match name:
             case "embed_tokens":
-                model += [(Embedding(arr), False)]
+                input_embed = Embedding(arr)
                 output_embed = Linear(arr)
             case "norm" :
                 output_norm = RMSNorm(arr, cfg.rms_eps)
@@ -236,12 +237,12 @@ def parse_model(
                     )
                     kv_caches.append(self_attn.KV_cache)
                 case _: raise Exception("Unknown layer, aborting")
-        model += [(TransformerBlock(mlp, input_layernorm, self_attn, residual_rms), True)] 
+        transformer_blocks += [TransformerBlock(mlp, input_layernorm, self_attn, residual_rms)] 
 
     output_layers = [output_norm, output_embed]
 
 
-    return model, output_layers, kv_caches
+    return  input_embed, transformer_blocks, output_layers, kv_caches
 
 class Qwen2_5_0_5B_Instruct(Model):
     model_dir = model_dir
@@ -259,7 +260,7 @@ class Qwen2_5_0_5B_Instruct(Model):
         model_cfg = ModelConfig(cfg)
         self.device = torch.device(device)
         self.model_dir = model_dir 
-        self.layers, self.output_layers, self.kv_caches = parse_model(
+        self.input_embed, self.transformer_blocks, self.output_layers, self.kv_caches = parse_model(
             model_file,
             model_cfg,
             self.device,
@@ -267,32 +268,33 @@ class Qwen2_5_0_5B_Instruct(Model):
             cache_max_seq_len=cache_max_seq_len,
             memory_available=memory_available,
         )
-  
-    @torch.inference_mode()
-    def __call__(self, input: torch.Tensor, state: ModelForwardState) -> torch.Tensor:
-        tokens = state.tokens.to(self.device)
-        mask = None if state.mask is None else state.mask.to(self.device)
-        out = input.to(self.device)
-        for layer in self.layers: 
-            layer, is_transformer = layer
-            out = layer(out, state) if is_transformer else layer(out)
-        if state.prefill_state is not None:
-            out = torch.stack(
-                [
-                    out[idx, int(prefill.length.item()) - 1]
-                    for idx, prefill in enumerate(state.prefill_state)
-                ]
-            )
-        else:
-            out = out[:, -1, :]
-        if state.prefill:
-            out = out[[prefill.last_chunk for prefill in state.prefill_state]]
+    
+    def prefill(self, state_buff:PrefillStateBuff):
+        out = self.input_embed(state_buff.tokens.to(self.device))
+        for transformer_layer in self.transformer_blocks: 
+            out = transformer_layer.prefill(out, state_buff)
+        batch_idx = torch.arange(out.size(0), device=out.device)
+        out = out[batch_idx, state_buff.seq_lens - 1]
+        for layer in self.output_layers:
+            out = layer(out)
+        return out
+
+    def decode(self, state_buff:DecodeStateBuff):
+        out = self.input_embed(state_buff.tokens.to(self.device))
+        for transformer_layer in self.transformer_blocks:
+            out = transformer_layer.decode(out, state_buff)        
+        out = out[:, -1, :]
         for layer in self.output_layers:
             out = layer(out)
         return out
 
     def get_model_dir(self):
         return self.model_dir
+
+    def KV_init(self, handle_id, prompt_tokens):
+        for kv_cache in self.kv_caches:
+            kv_cache.init(handle_id, prompt_tokens)
+    
 
 if __name__ == '__main__':
     pages = os.sysconf("SC_PHYS_PAGES")

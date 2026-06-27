@@ -1,11 +1,14 @@
 from einops import rearrange
 import torch
-from torch.nn.utils.rnn import pad_sequence
 import math
 
 from kvcache import RadixKVCache
-from layers.triton_kernels import paged_mqa_decode, residual_rms
-from models.model import ModelForwardState
+from layers.triton_kernels import (
+    paged_mqa_decode, paged_mqa_prefill, 
+    write_mqa_decode_kv, write_mqa_prefill_kv, 
+    residual_rms)
+
+from models.model import PrefillStateBuff, DecodeStateBuff
 
 class Embedding:
     def __init__(self, weights:torch.Tensor):
@@ -69,13 +72,6 @@ class RoPe:
         # x: [B, H, L, D]
         B, H, L, D = x.shape
         half = D // 2
-        if position is None:
-            position = torch.arange(L, device=x.device).unsqueeze(0).expand(B, -1)
-        else:
-            position = torch.as_tensor(position, device=x.device)
-            if position.shape != (B, L):
-                raise ValueError(f"Unsupported RoPE position shape {tuple(position.shape)} for x shape {tuple(x.shape)}")
-
         cos = self.cos[position].to(x.device)[:, None, :, :]
         sin = self.sin[position].to(x.device)[:, None, :, :]
 
@@ -120,117 +116,8 @@ class MultiQueryAttention:
         self.k_bias = None if k_bias is None else k_bias
         self.v_bias = None if v_bias is None else v_bias
 
-    def __call__(self, x:torch.Tensor, state: ModelForwardState):
-        if state.prefill:
-            return self._prefill(x, state)
-        return self._generate(x, state)
 
-    def _prefill(self, x:torch.Tensor, state: ModelForwardState):
-        batch_size = x.size(0)
-
-        # first call init for any uuids that have the first chunk in this batch
-        init_uuid = []
-        init_tokens = []
-        for bidx in range(batch_size):
-            prefill = state.prefill_state[bidx]
-            if prefill.first_chunk:
-                init_uuid.append(state.uuid[bidx])
-                init_tokens.append(prefill.prompt_tokens)
-        if init_uuid:
-            self.KV_cache.init(tuple(init_uuid), init_tokens)
-
-        out = torch.zeros_like(x)
-        for bidx in range(batch_size):
-            prefill = state.prefill_state[bidx]
-            chunk_len = int(prefill.length.item())
-            if chunk_len == 0:
-                continue
-
-            chunk_start = prefill.offset
-            chunk_end = chunk_start + chunk_len
-            row = x[bidx:bidx + 1, :chunk_len, :]
-
-            pages_info, cached_chunk_tokens = self.KV_cache.get_prefill_chunk_info(
-                state.uuid[bidx],
-                chunk_start,
-                chunk_len,
-            )
-            if cached_chunk_tokens == chunk_len:
-                if not prefill.last_chunk:
-                    continue
-                query_start = chunk_len - 1
-            else:
-                query_start = cached_chunk_tokens
-
-            query_x = row[:, query_start:chunk_len, :]
-            query_len = chunk_len - query_start
-            query_offset = chunk_start + query_start
-            q = self.q_weights(query_x)
-            q = q + self.q_bias if self.q_bias is not None else q
-            qh = rearrange(q, "b l (h d) -> b h l d", h=self.num_attn_heads)
-            if self.rope is not None:
-                q_positions = torch.arange(query_offset, chunk_end, device=row.device).unsqueeze(0)
-                qh = self.rope(qh, position=q_positions)
-
-            cached_tokens = chunk_start + cached_chunk_tokens
-            kh = torch.zeros((self.num_kv_heads, chunk_end, self.head_dim), device=row.device, dtype=row.dtype)
-            vh = torch.zeros_like(kh)
-            if cached_tokens > 0:
-                self._load_cached_prefix(kh, vh, pages_info["indexes"], cached_tokens)
-
-            if cached_chunk_tokens < chunk_len:
-                suffix_x = row[:, cached_chunk_tokens:chunk_len, :]
-                k = self.k_weights(suffix_x)
-                v = self.v_weights(suffix_x)
-                k = k + self.k_bias if self.k_bias is not None else k
-                v = v + self.v_bias if self.v_bias is not None else v
-                k_suffix = rearrange(k, "b l (h d) -> b h l d", h=self.num_kv_heads)
-                v_suffix = rearrange(v, "b l (h d) -> b h l d", h=self.num_kv_heads)
-                if self.rope is not None:
-                    suffix_positions = torch.arange(chunk_start + cached_chunk_tokens, chunk_end, device=row.device).unsqueeze(0)
-                    k_suffix = self.rope(k_suffix, position=suffix_positions)
-                kh[:, chunk_start + cached_chunk_tokens:chunk_end, :] = k_suffix[0]
-                vh[:, chunk_start + cached_chunk_tokens:chunk_end, :] = v_suffix[0]
-                write_len = chunk_len - cached_chunk_tokens
-                self.KV_cache.prefill(
-                    (state.uuid[bidx],),
-                    state.tokens[bidx:bidx + 1, cached_chunk_tokens:chunk_len],
-                    k_suffix,
-                    v_suffix,
-                    torch.ones((1, write_len), device=state.tokens.device, dtype=torch.bool),
-                )
-
-            group = self.num_attn_heads // self.num_kv_heads
-            qg = qh[0].view(self.num_kv_heads, group, query_len, self.head_dim)
-            kg = kh.unsqueeze(1)
-            vg = vh.unsqueeze(1)
-            attn_scores = torch.matmul(qg, kg.transpose(-1, -2)) / math.sqrt(self.head_dim)
-            query_positions = torch.arange(query_offset, chunk_end, device=attn_scores.device)
-            key_positions = torch.arange(chunk_end, device=attn_scores.device)
-            causal = key_positions.unsqueeze(0) > query_positions.unsqueeze(1)
-            attn_scores = attn_scores.masked_fill(causal[None, None, :, :], float("-inf"))
-            attn = attn_scores.softmax(dim=-1)
-            out_g = torch.matmul(attn, vg)
-            out_heads = rearrange(out_g, "h_kv g l d -> l (h_kv g d)")
-            out[bidx:bidx + 1, query_start:chunk_len, :] = self.outproj(out_heads.unsqueeze(0))
-        
-        return out
-
-    def _load_cached_prefix(self, kh: torch.Tensor, vh: torch.Tensor, indexes, cached_tokens: int):
-        tokens_seen = 0
-        K_pages, V_pages = self.KV_cache.get_pages(indexes)
-        for k_block, v_block in zip(K_pages, V_pages):
-            valid_tokens = min(self.KV_cache.block_size, cached_tokens - tokens_seen)
-            if valid_tokens <= 0:
-                break
-            kh[:, tokens_seen:tokens_seen + valid_tokens, :] = k_block[:, :valid_tokens, :]
-            vh[:, tokens_seen:tokens_seen + valid_tokens, :] = v_block[:, :valid_tokens, :]
-            tokens_seen += valid_tokens
-
-    def _generate(self, x:torch.Tensor, state: ModelForwardState):
-        tokens = state.tokens
-        uuid = state.uuid
-        
+    def attention_prologue(self, x, rope_positions):
         Q = self.q_weights(x)
         K = self.k_weights(x)
         V = self.v_weights(x)
@@ -241,52 +128,157 @@ class MultiQueryAttention:
         Qh = rearrange(Q, "b l (h d) -> b h l d", h=self.num_attn_heads)
         Kh = rearrange(K, "b l (h d) -> b h l d", h=self.num_kv_heads)
         Vh = rearrange(V, "b l (h d) -> b h l d", h=self.num_kv_heads)
-        q_positions = self.KV_cache.get_q_position(uuid)
+        
         if self.rope is not None:
-            Qh = self.rope(Qh, position=q_positions)
-            Kh = self.rope(Kh, position=q_positions)
+            Qh = self.rope(Qh, position=rope_positions)
+            Kh = self.rope(Kh, position=rope_positions)
 
-        pages_info = self.KV_cache.append_and_fetch(uuid, Kh, Vh, tokens[:, 0])
-        seq_len_per_page = self.KV_cache.block_size
+        # The Triton kernels use flat pointer arithmetic for [B, H, L, D].
+        # rearrange() returns a strided view, and Vh remains strided because it
+        # does not pass through RoPE's concatenation.
+        return Qh.contiguous(), Kh.contiguous(), Vh.contiguous()
+
+
+    def _write_prefill_kv(self, input_meta: PrefillStateBuff, Kh: torch.Tensor, Vh: torch.Tensor, batch_size: int):
+        block_size = self.KV_cache.block_size
+        
+        if Kh.device.type == "cuda":
+            write_mqa_prefill_kv(
+                K_cache=self.KV_cache.K,
+                V_cache=self.KV_cache.V,
+                Kh=Kh,
+                Vh=Vh,
+                page_indexes=input_meta.page_indexes,
+                page_index_stride=input_meta.page_indexes.stride(0),
+                offsets=input_meta.offsets,
+                seq_lens=input_meta.seq_lens,
+                batch_size=batch_size,
+                seq_len_per_page=block_size,
+                chunk_size=input_meta.chunk_size,
+                d_head=self.head_dim,
+                num_kv_heads=self.num_kv_heads,
+            )
+            return
+        
+        for idx in range(batch_size):
+            offset = int(input_meta.offsets[idx].item())
+            seq_len = int(input_meta.seq_lens[idx].item())
+            written = 0
+            while written < seq_len:
+                abs_pos = offset + written
+                page_slot = abs_pos // block_size
+                page_offset = abs_pos % block_size
+                write_len = min(seq_len - written, block_size - page_offset)
+                page_idx = input_meta.page_indexes[idx, page_slot]
+                self.KV_cache.K[page_idx, :, page_offset:page_offset + write_len, :] = Kh[idx, :, written:written + write_len, :]
+                self.KV_cache.V[page_idx, :, page_offset:page_offset + write_len, :] = Vh[idx, :, written:written + write_len, :]
+                written += write_len
+
+    def _write_decode_kv(self, input_meta: DecodeStateBuff, Kh: torch.Tensor, Vh: torch.Tensor, batch_size: int):
+        block_size = self.KV_cache.block_size
+        if Kh.device.type == "cuda":
+            write_mqa_decode_kv(
+                K_cache=self.KV_cache.K,
+                V_cache=self.KV_cache.V,
+                Kh=Kh,
+                Vh=Vh,
+                page_indexes=input_meta.page_indexes,
+                page_index_stride=input_meta.page_indexes.stride(0),
+                offsets=input_meta.offsets,
+                batch_size=batch_size,
+                seq_len_per_page=block_size,
+                d_head=self.head_dim,
+                num_kv_heads=self.num_kv_heads,
+            )
+            return
+
+        for idx in range(batch_size):
+            offset = int(input_meta.offsets[idx].item())
+            page_slot = offset // block_size
+            page_offset = offset % block_size
+            page_idx = input_meta.page_indexes[idx, page_slot]
+            self.KV_cache.K[page_idx, :, page_offset, :] = Kh[idx, :, 0, :]
+            self.KV_cache.V[page_idx, :, page_offset, :] = Vh[idx, :, 0, :]
+
+    def prefill(self, x, input_meta:PrefillStateBuff):
+        batch_size = x.size(0)
+        seq_len = x.size(1)
+        positions = torch.arange(seq_len, dtype=torch.int32, device=x.device)
+        rope_positions = input_meta.offsets[:, None] + positions[None, :]
+        rope_positions = rope_positions.clamp_max(self.max_seq_len - 1)
+        
+        Qh, Kh, Vh = self.attention_prologue(x, rope_positions)
+        self._write_prefill_kv(input_meta, Kh, Vh, batch_size)
+
         out = torch.zeros(
-                    x.shape[0],
-                    self.num_attn_heads,
-                    self.head_dim,
-                    dtype=Q.dtype,
-                    device=Q.device,
-                )
+            batch_size,
+            self.num_attn_heads,
+            seq_len,
+            self.head_dim,
+            dtype=x.dtype,
+            device=x.device,
+        )
 
         if x.device.type == "cuda":
-
-            page_indexes = [torch.tensor(pm["indexes"], device=x.device) for pm in pages_info]
-            padded_indexes = pad_sequence(page_indexes,batch_first=True,padding_value=-1)
-
-            attn_out = paged_mqa_decode(
+            paged_mqa_prefill(
                 q=Qh, K_cache=self.KV_cache.K, V_cache=self.KV_cache.V, out=out,
-                page_indexes = padded_indexes,
-                page_index_stride = padded_indexes.stride(0),
-                batch_size = len(uuid),
-                tok_cnt= torch.tensor([page["token_count"] for page in pages_info], device=Q.device),
-                seq_len_per_page=seq_len_per_page,
+                page_indexes = input_meta.page_indexes,
+                page_index_stride = input_meta.page_indexes.stride(0),
+                batch_size = batch_size,
+                offsets = input_meta.offsets,
+                seq_lens = input_meta.seq_lens,
+                chunk_size = input_meta.chunk_size,
+                seq_len_per_page=self.KV_cache.block_size,
                 d_head=self.head_dim,
                 num_attn_heads=self.num_attn_heads,
                 num_kv_heads=self.num_kv_heads,
             )
-
+ 
         else:
-            self._paged_mqa_cpu(pages_info, Qh, out)
+            self._paged_prefill_cpu(input_meta.offsets, input_meta.seq_lens, input_meta.page_indexes, batch_size, Qh, out)
+        out = rearrange(out, "b h l d -> b l (h d)")
+        return self.outproj(out)
 
+    def decode(self, x:torch.Tensor, input_meta:DecodeStateBuff):
+        batch_size = x.shape[0]
+        rope_positions = input_meta.offsets[:, None]
+        Qh, Kh, Vh = self.attention_prologue(x, rope_positions)
+        self._write_decode_kv(input_meta, Kh, Vh, batch_size)
+
+        token_counts = input_meta.offsets + 1
+        out = torch.zeros(
+                    batch_size,
+                    self.num_attn_heads,
+                    self.head_dim,
+                    dtype=x.dtype,
+                    device=x.device,
+                )
+
+        if x.device.type == "cuda":
+            paged_mqa_decode(
+                q=Qh, K_cache=self.KV_cache.K, V_cache=self.KV_cache.V, out=out,
+                page_indexes = input_meta.page_indexes,
+                page_index_stride = input_meta.page_indexes.stride(0),
+                batch_size = batch_size,
+                tok_cnt= token_counts,
+                seq_len_per_page=self.KV_cache.block_size,
+                d_head=self.head_dim,
+                num_attn_heads=self.num_attn_heads,
+                num_kv_heads=self.num_kv_heads,
+            )
+        else:
+            self._paged_decode_cpu(token_counts, input_meta.page_indexes, batch_size, Qh, out)
         out = rearrange(out, "b h d -> b 1 (h d)")
         return self.outproj(out)
     
-    def _paged_mqa_cpu(self, pages_info, Qh, out):
+    def _paged_decode_cpu(self, token_counts, page_indexes, batch_size, Qh, out):
         group_size = self.num_attn_heads // self.num_kv_heads
         scale = 1 / math.sqrt(self.head_dim)
         kv_head_idx = torch.arange(self.num_attn_heads, device=Qh.device) // group_size
 
-        for idx, state in enumerate(pages_info):
-            q = Qh[idx].squeeze(dim=1).to(torch.float32)
-            token_count = state["token_count"]
+        for idx in range(batch_size):
+            q = Qh[idx, :, 0, :].to(torch.float32)
+            token_count = int(token_counts[idx].item())
             m_max = torch.full((self.num_attn_heads,), float("-inf"), device=Qh.device)
             l = torch.zeros((self.num_attn_heads,), device=Qh.device)
             acc = torch.zeros(
@@ -296,7 +288,7 @@ class MultiQueryAttention:
                 device=Qh.device,
             )
             tokens_seen = 0
-            K_pages,V_pages = self.KV_cache.get_pages(state["indexes"])
+            K_pages, V_pages = self.KV_cache.get_pages(page_indexes[idx])
             for k_block, v_block in zip(K_pages, V_pages):
                 valid_tokens = min(self.KV_cache.block_size, token_count - tokens_seen)
                 if valid_tokens <= 0:
@@ -314,6 +306,56 @@ class MultiQueryAttention:
                 tokens_seen += valid_tokens
             out[idx] = (acc / l[:, None]).to(out.dtype)
 
+    def _paged_prefill_cpu(self, offsets, seq_lens, page_indexes, batch_size, Qh, out):
+        group_size = self.num_attn_heads // self.num_kv_heads
+        scale = 1 / math.sqrt(self.head_dim)
+        kv_head_idx = torch.arange(self.num_attn_heads, device=Qh.device) // group_size
+
+        for idx in range(batch_size):
+            offset = int(offsets[idx].item())
+            seq_len = int(seq_lens[idx].item())
+            token_count = offset + seq_len
+            if seq_len <= 0:
+                continue
+
+            q = Qh[idx, :, :seq_len, :].to(torch.float32)
+            query_limits = offset + torch.arange(seq_len, device=Qh.device)
+            m_max = torch.full((self.num_attn_heads, seq_len), float("-inf"), device=Qh.device)
+            l = torch.zeros((self.num_attn_heads, seq_len), device=Qh.device)
+            acc = torch.zeros(
+                self.num_attn_heads,
+                seq_len,
+                self.head_dim,
+                dtype=torch.float32,
+                device=Qh.device,
+            )
+
+            tokens_seen = 0
+            K_pages, V_pages = self.KV_cache.get_pages(page_indexes[idx])
+            for k_block, v_block in zip(K_pages, V_pages):
+                valid_tokens = min(self.KV_cache.block_size, token_count - tokens_seen)
+                if valid_tokens <= 0:
+                    break
+
+                k_block = k_block[:, :valid_tokens, :][kv_head_idx].to(torch.float32)
+                v_block = v_block[:, :valid_tokens, :][kv_head_idx].to(torch.float32)
+                scores = torch.einsum("h q d, h s d -> h q s", q, k_block) * scale
+
+                key_positions = tokens_seen + torch.arange(valid_tokens, device=Qh.device)
+                causal_mask = key_positions[None, :] <= query_limits[:, None]
+                scores = scores.masked_fill(~causal_mask[None, :, :], float("-inf"))
+
+                m_block = scores.max(dim=-1).values
+                m_new = torch.maximum(m_max, m_block)
+                old_rescale = torch.exp(m_max - m_new)
+                m_max = m_new
+                weight = torch.exp(scores - m_max[:, :, None])
+                l = l * old_rescale + torch.sum(weight, dim=-1)
+                acc = acc * old_rescale[:, :, None] + torch.einsum("h q s, h s d -> h q d", weight, v_block)
+                tokens_seen += valid_tokens
+
+            out[idx, :, :seq_len, :] = (acc / l[:, :, None]).to(out.dtype)
+
 class TransformerBlock:
     def __init__(self, mlp, pre_norm, attention, residual_rms):
         self.mlp = mlp
@@ -321,7 +363,12 @@ class TransformerBlock:
         self.attention = attention
         self.residual_rms = residual_rms
 
-    def __call__(self, x:torch.Tensor, state: ModelForwardState):
+    def decode(self, x:torch.Tensor, input_meta:DecodeStateBuff):
         attn_in = self.pre_norm(x)
-        x, mlp_in =  self.residual_rms(x, self.attention(attn_in, state))
-        return  x + self.mlp(mlp_in)
+        x, mlp_in = self.residual_rms(x, self.attention.decode(attn_in, input_meta))
+        return x + self.mlp(mlp_in)
+
+    def prefill(self, x, input_meta:PrefillStateBuff):
+        attn_in = self.pre_norm(x)
+        x, mlp_in = self.residual_rms(x, self.attention.prefill(attn_in, input_meta))
+        return x + self.mlp(mlp_in)

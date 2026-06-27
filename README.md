@@ -2,8 +2,16 @@
 
 Minimal OpenAI-compatible LLM serving engine.
 
+## Features
+
+- Paged attention
+- Continuous batching across prefill and decode
+- Prefix KV cache
+- Chunked prefill
+- Custom Triton kernels and CUDA graph replay on the CUDA backend
+
 Supported model:
-- `qwen2_5_0_5b_instruct`
+- `qwen2_5_0_5b_instruct` with 300 + toks/sec for single request on rtx5070
 
 Supported backends:
 - `cpu`
@@ -40,9 +48,18 @@ MODEL_PREFILL_CHUNK_SIZE=256
 
 Example:
 
+running on cpu:
+
 ```bash
 MODEL_BACKEND=cpu MODEL_CPU_RESERVE_GB=8 uv run uvicorn api_server:app --host 0.0.0.0 --port 8000
 ```
+
+running on gpu:
+
+```bash
+MODEL_BACKEND=cuda uv run uvicorn api_server:app --host 0.0.0.0 --port 8000
+```
+
 
 ## API
 

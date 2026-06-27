@@ -52,7 +52,7 @@ class Engine:
         max_cache_seq_len=4096,
         cpu_reserve_gb=CPU_SYSTEM_RESERVE_GB,
         cuda_memory_fraction=CUDA_MEMORY_FRACTION,
-        prefill_chunk_size=None,
+        prefill_chunk_size=64,
     ):
         # detect backend and init
         self.backend = backend if backend.is_available() else BACKEND.CPU
@@ -141,7 +141,7 @@ class Engine:
 
         completion_tokens = 0
         for _ in range(max_tokens):
-            tok = await backend.next_token(handle)
+            tok = await backend.decode(handle)
             if tok == self.tokenizer.tokenizer.eos_token_id:
                 break
 

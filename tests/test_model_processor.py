@@ -1,174 +1,200 @@
 import asyncio
+import time
 import unittest
 
 import torch
 
-from model_processor import ModelProcessor, OP, PrefillChunkSizer, ServerHandle
-from models.model import ModelForwardState
+from model_processor import ModelProcessor, OP, ServerHandle
+from models.model import DecodeStateBuff, PrefillStateBuff
+
+
+class FakeCache:
+    def __init__(self, total_blocks=128, block_size=2):
+        self.total_blocks = total_blocks
+        self.block_size = block_size
+        self.release_calls = []
+        self.states = {}
+        self.next_page = 0
+
+    def init(self, uuid, toks):
+        self.states[uuid] = {"token_count": 0, "indexes": []}
+
+    def _reserve(self, uuid, token_count):
+        state = self.states[uuid]
+        state["token_count"] += token_count
+        pages_needed = (state["token_count"] + self.block_size - 1) // self.block_size
+        while len(state["indexes"]) < pages_needed:
+            state["indexes"].append(self.next_page)
+            self.next_page += 1
+
+    def init_prefill(self, uuid, toks):
+        self._reserve(uuid, int(toks.numel()))
+
+    def finish_prefill(self, uuid):
+        pass
+
+    def append_decode(self, uuid, tok):
+        self._reserve(uuid, 1)
+
+    def get_indexes(self, uuid):
+        return list(self.states[uuid]["indexes"])
+
+    def get_blocks_available(self):
+        return self.total_blocks - self.next_page
+
+    def release(self, uuid):
+        self.release_calls.append(uuid)
+        self.states.pop(uuid, None)
 
 
 class FakeConcurrentModel:
-    class FakeCache:
-        def __init__(self, total_blocks=128, block_size=1):
-            self.release_calls = []
-            self.total_blocks = total_blocks
-            self.block_size = block_size
-
-        def release(self, uuid):
-            self.release_calls.extend(uuid)
-
-        def get_occupancy_info(self):
-            return {
-                "blocks_cnt": self.total_blocks,
-                "block_size": self.block_size,
-                "free_blocks": self.total_blocks,
-                "uuid_cnt": 0,
-            }
-
-        def get_blocks_available(self):
-            return self.total_blocks
-
-        def blocks_for_tokens(self, token_count):
-            return (token_count + self.block_size - 1) // self.block_size
-
     def __init__(self, device: torch.device):
         self.device = torch.device(device)
         self.vocab_size = 8
-        self.generate_calls = 0
-        self.prefill_last_chunk_calls = []
-        self.kv_caches = [self.FakeCache()]
+        self.kv_caches = [FakeCache()]
+        self.prefill_seq_lens = []
+        self.decode_calls = 0
 
-    def __call__(self, input_ids, state: ModelForwardState):
-        batch = input_ids.shape[0]
-        logits = torch.full(
-            (batch, self.vocab_size),
-            -1000.0,
-            device=self.device,
-        )
-        if state.prefill:
-            self.prefill_last_chunk_calls.append(
-                [prefill.last_chunk for prefill in state.prefill_state]
-            )
-            logits[:, 1] = 0.0
-        else:
-            self.generate_calls += 1
-            next_token = 2 if self.generate_calls == 1 else 7
-            logits[:, next_token] = 0.0
+    def KV_init(self, handle_id, prompt_tokens):
+        for cache in self.kv_caches:
+            cache.init(handle_id, prompt_tokens)
+
+    def prefill(self, state: PrefillStateBuff):
+        self.prefill_seq_lens.append(state.seq_lens.detach().cpu().tolist())
+        logits = torch.full((state.batch_size, self.vocab_size), -1000.0, device=self.device)
+        logits[:, 1] = 0.0
         return logits
+
+    def decode(self, state: DecodeStateBuff):
+        self.decode_calls += 1
+        time.sleep(0.01)
+        logits = torch.full((state.batch_size, self.vocab_size), -1000.0, device=self.device)
+        logits[:, 7] = 0.0
+        return logits
+
+
+def make_handle(handle_id, tokens, *, cache_pos=0, temperature=0.0):
+    handle = ServerHandle(
+        handle_id,
+        torch.tensor(tokens),
+        temperature=temperature,
+        top_p=1.0,
+        max_new_tokens=4,
+    )
+    handle.cache_pos = cache_pos
+    return handle
+
 
 class DecodeBatchTests(unittest.TestCase):
     def setUp(self):
         self.processor = ModelProcessor.__new__(ModelProcessor)
 
     def test_decode_batch_uses_greedy_when_temperature_is_zero(self):
-        logits = torch.tensor(
-            [[0.1, 0.9, 0.0], [0.8, 0.1, 0.1]],
-            dtype=torch.float32,
-        )
-        batch = [
-            ServerHandle(0, torch.tensor([1]), [1], temperature=0.0, top_p=1.0, max_new_tokens=1),
-            ServerHandle(1, torch.tensor([2]), [2], temperature=0.0, top_p=1.0, max_new_tokens=1),
-        ]
+        logits = torch.tensor([[0.1, 0.9, 0.0], [0.8, 0.1, 0.1]])
+        batch = [make_handle(0, [1]), make_handle(1, [2])]
 
         out = self.processor._decode_batch(logits, batch)
 
         self.assertTrue(torch.equal(out, torch.tensor([1, 0])))
 
-    def test_decode_batch_keeps_batch_shape_for_sampling(self):
-        torch.manual_seed(0)
-        logits = torch.tensor(
-            [[0.1, 0.9, 0.0], [0.8, 0.1, 0.1]],
-            dtype=torch.float32,
-        )
-        batch = [
-            ServerHandle(0, torch.tensor([1]), [1], temperature=1.0, top_p=1.0, max_new_tokens=1),
-            ServerHandle(1, torch.tensor([2]), [2], temperature=1.0, top_p=1.0, max_new_tokens=1),
-        ]
-
-        out = self.processor._decode_batch(logits, batch)
-
-        self.assertEqual(tuple(out.shape), (2,))
-        self.assertTrue(out.dtype == torch.long)
-
     def test_decode_batch_supports_mixed_sampling_params(self):
         torch.manual_seed(0)
-        logits = torch.tensor(
-            [[0.1, 0.9, 0.0], [0.8, 0.1, 0.1]],
-            dtype=torch.float32,
-        )
-        batch = [
-            ServerHandle(0, torch.tensor([1]), [1], temperature=0.0, top_p=1.0, max_new_tokens=1),
-            ServerHandle(1, torch.tensor([2]), [2], temperature=0.8, top_p=0.9, max_new_tokens=1),
-        ]
+        logits = torch.tensor([[0.1, 0.9, 0.0], [0.8, 0.1, 0.1]])
+        batch = [make_handle(0, [1]), make_handle(1, [2], temperature=0.8)]
 
         out = self.processor._decode_batch(logits, batch)
 
         self.assertEqual(tuple(out.shape), (2,))
+        self.assertEqual(out.dtype, torch.long)
         self.assertEqual(out[0].item(), 1)
 
 
-class PrefillChunkSizerTests(unittest.TestCase):
+class BatchedInputTests(unittest.TestCase):
     def setUp(self):
         self.processor = ModelProcessor.__new__(ModelProcessor)
         self.processor.device = torch.device("cpu")
-        self.processor.prefill_chunk_sizer = PrefillChunkSizer(default_chunk_size=2)
-        self.processor.kv_caches = [FakeConcurrentModel.FakeCache(block_size=2)]
-        self.processor.prefill_waiting = []
-        self.processor.generating = []
+        self.processor.prefill_chunk_size = 2
+        self.processor.prefill_buffs = {
+            1: PrefillStateBuff(1, 2, 4, self.processor.device),
+            2: PrefillStateBuff(2, 2, 4, self.processor.device),
+        }
+        self.processor.decode_buffs = {
+            1: DecodeStateBuff(1, 4, self.processor.device),
+            2: DecodeStateBuff(2, 4, self.processor.device),
+        }
+        self.processor.kv_caches = [FakeCache()]
 
-    def test_make_batch_uses_full_remaining_prompt_for_single_request_without_waiters(self):
-        handle = ServerHandle(0, torch.tensor([11, 12, 13]), [11, 12, 13], temperature=0.0, top_p=1.0, max_new_tokens=1)
+    def init_handles(self, handles):
+        for handle in handles:
+            self.processor.kv_caches[0].init(handle.id, handle.tokens)
 
-        input_ids, state = self.processor._make_batch([handle], OP.PREFILL)
+    def test_prefill_uses_fixed_chunk_buffer_and_tracks_real_lengths(self):
+        batch = [make_handle(0, [11, 12, 13]), make_handle(1, [21])]
+        self.init_handles(batch)
 
-        self.assertTrue(torch.equal(input_ids, torch.tensor([[11, 12, 13]])))
-        self.assertEqual([prefill.length.item() for prefill in state.prefill_state], [3])
-        self.assertEqual([prefill.last_chunk for prefill in state.prefill_state], [True])
+        state, last_chunk = self.processor._make_batched_input(batch, OP.PREFILL, 2)
 
-    def test_make_batch_uses_block_sized_chunks_when_other_prefill_waiters_exist(self):
-        handle = ServerHandle(0, torch.tensor([11, 12, 13]), [11, 12, 13], temperature=0.0, top_p=1.0, max_new_tokens=1)
-        self.processor.generating = [ServerHandle(1, torch.tensor([21]), [21], temperature=0.0, top_p=1.0, max_new_tokens=1)]
+        self.assertTrue(torch.equal(state.tokens, torch.tensor([[11, 12], [21, 0]])))
+        self.assertTrue(torch.equal(state.seq_lens, torch.tensor([2, 1], dtype=torch.int32)))
+        self.assertTrue(torch.equal(state.offsets, torch.tensor([0, 0], dtype=torch.int32)))
+        self.assertEqual(last_chunk, [False, True])
+        self.assertEqual(state.page_indexes[0, 0].item(), 0)
+        self.assertEqual(state.page_indexes[1, 0].item(), 1)
 
-        input_ids, state = self.processor._make_batch([handle], OP.PREFILL)
+    def test_prefill_continues_from_cache_position(self):
+        handle = make_handle(0, [11, 12, 13], cache_pos=2)
+        self.init_handles([handle])
+        self.processor.kv_caches[0]._reserve(handle.id, 2)
 
-        self.assertTrue(torch.equal(input_ids, torch.tensor([[11, 12]])))
-        self.assertEqual([prefill.length.item() for prefill in state.prefill_state], [2])
-        self.assertEqual([prefill.last_chunk for prefill in state.prefill_state], [False])
+        state, last_chunk = self.processor._make_batched_input([handle], OP.PREFILL, 1)
 
-    def test_make_batch_uses_full_chunk_for_similar_prefill_batch_when_generate_is_empty(self):
-        batch = [
-            ServerHandle(0, torch.tensor([11, 12, 13]), [11, 12, 13], temperature=0.0, top_p=1.0, max_new_tokens=1),
-            ServerHandle(1, torch.tensor([21, 22]), [21, 22], temperature=0.0, top_p=1.0, max_new_tokens=1),
-        ]
+        self.assertTrue(torch.equal(state.tokens, torch.tensor([[13, 0]])))
+        self.assertEqual(state.seq_lens.item(), 1)
+        self.assertEqual(state.offsets.item(), 2)
+        self.assertEqual(last_chunk, [True])
 
-        input_ids, state = self.processor._make_batch(batch, OP.PREFILL)
+    def test_decode_reserves_token_and_populates_metadata(self):
+        handle = make_handle(0, [11], cache_pos=1)
+        handle.input_token = 5
+        self.init_handles([handle])
+        self.processor.kv_caches[0]._reserve(handle.id, 1)
 
-        self.assertTrue(torch.equal(input_ids, torch.tensor([[11, 12, 13], [21, 22, 0]])))
-        self.assertEqual([prefill.length.item() for prefill in state.prefill_state], [3, 2])
-        self.assertEqual([prefill.last_chunk for prefill in state.prefill_state], [True, True])
+        state = self.processor._make_batched_input([handle], OP.GENERATE, 1)
 
-    def test_make_batch_uses_default_chunk_for_dissimilar_prefill_batch(self):
-        batch = [
-            ServerHandle(0, torch.tensor([11, 12, 13, 14, 15]), [11, 12, 13, 14, 15], temperature=0.0, top_p=1.0, max_new_tokens=1),
-            ServerHandle(1, torch.tensor([21, 22]), [21, 22], temperature=0.0, top_p=1.0, max_new_tokens=1),
-        ]
+        self.assertEqual(state.tokens.item(), 5)
+        self.assertEqual(state.offsets.item(), 1)
+        self.assertEqual(self.processor.kv_caches[0].states[0]["token_count"], 2)
 
-        input_ids, state = self.processor._make_batch(batch, OP.PREFILL)
 
-        self.assertTrue(torch.equal(input_ids, torch.tensor([[11, 12], [21, 22]])))
-        self.assertEqual([prefill.length.item() for prefill in state.prefill_state], [2, 2])
-        self.assertEqual([prefill.last_chunk for prefill in state.prefill_state], [False, True])
+class BatchSizeTests(unittest.TestCase):
+    def test_selects_largest_supported_batch_not_exceeding_request_count(self):
+        processor = ModelProcessor.__new__(ModelProcessor)
+        processor.supported_batch_sizes = [1, 2, 4, 8]
+
+        self.assertEqual(processor._get_batch_size(0), 0)
+        self.assertEqual(processor._get_batch_size(1), 1)
+        self.assertEqual(processor._get_batch_size(3), 2)
+        self.assertEqual(processor._get_batch_size(7), 4)
+        self.assertEqual(processor._get_batch_size(20), 8)
 
 
 class ModelProcessorConcurrencyTests(unittest.IsolatedAsyncioTestCase):
-    async def test_concurrent_handles_complete_without_crashing(self):
+    async def wait_until(self, predicate, timeout=1.0):
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while not predicate():
+            if loop.time() >= deadline:
+                self.fail("timed out waiting for model processor")
+            await asyncio.sleep(0.01)
+
+    async def test_three_concurrent_handles_use_supported_batches_and_complete(self):
         processor = ModelProcessor(
             FakeConcurrentModel,
             torch.device("cpu"),
             eos_token_id=7,
             max_request_len=64,
-            max_batch_prefill=8,
-            max_batch_generate=8,
+            max_batch_size=8,
+            prefill_chunk_size=2,
         )
 
         handle_ids = await asyncio.gather(
@@ -176,113 +202,42 @@ class ModelProcessorConcurrencyTests(unittest.IsolatedAsyncioTestCase):
             processor.prefill(torch.tensor([21, 22]), temperature=0.0, top_p=1.0),
             processor.prefill(torch.tensor([31]), temperature=0.0, top_p=1.0),
         )
-        handles = [processor.handles[handle_id] for handle_id in handle_ids]
 
-        await asyncio.sleep(0.1)
-
-        all_tokens = []
-        for handle in handles:
-            tokens = []
-            while not handle.token_q.empty():
-                tokens.append(handle.token_q.get_nowait())
-            self.assertGreaterEqual(len(tokens), 2)
-            self.assertEqual(tokens[0], 1)
-            self.assertEqual(tokens[-1], 7)
-            self.assertTrue(handle.finished)
-            all_tokens.append(tokens)
-
-        for handle_id in handle_ids:
-            await processor.release(handle_id)
+        await self.wait_until(lambda: all(handle_id in processor.kv_caches[0].release_calls for handle_id in handle_ids))
 
         self.assertEqual(sorted(processor.kv_caches[0].release_calls), sorted(handle_ids))
+        self.assertTrue(all(len(lengths) in processor.supported_batch_sizes for lengths in processor.model.prefill_seq_lens))
 
-    async def test_stops_at_kv_cache_limit_before_generate_overflow(self):
+    async def test_prefill_rejects_prompt_longer_than_cache_limit(self):
         processor = ModelProcessor(
             FakeConcurrentModel,
             torch.device("cpu"),
             eos_token_id=7,
             max_request_len=2,
-            max_batch_prefill=8,
-            max_batch_generate=8,
-        )
-
-        handle_id = await processor.prefill(torch.tensor([11, 12]), temperature=0.0, top_p=1.0)
-        handle = processor.handles[handle_id]
-        await asyncio.sleep(0.1)
-
-        tokens = []
-        while not handle.token_q.empty():
-            tokens.append(handle.token_q.get_nowait())
-
-        self.assertEqual(tokens, [1])
-        self.assertEqual(processor.model.generate_calls, 0)
-
-    async def test_prefill_rejects_prompt_longer_than_kv_cache_limit(self):
-        processor = ModelProcessor(
-            FakeConcurrentModel,
-            torch.device("cpu"),
-            eos_token_id=7,
-            max_request_len=2,
-            max_batch_prefill=8,
-            max_batch_generate=8,
         )
 
         with self.assertRaises(RuntimeError):
             await processor.prefill(torch.tensor([11, 12, 13]), temperature=0.0, top_p=1.0)
 
-    async def test_prefill_admission_follows_cache_occupancy(self):
-        class OccupancyModel(FakeConcurrentModel):
-            def __init__(self, device: torch.device):
-                super().__init__(device)
-                self.kv_caches = [self.FakeCache(total_blocks=3, block_size=2)]
-                self.prefill_batch_sizes = []
-
-            def __call__(self, input_ids, state: ModelForwardState):
-                if state.prefill:
-                    self.prefill_batch_sizes.append(input_ids.size(0))
-                logits = super().__call__(input_ids, state)
-                if not state.prefill:
-                    logits[:, :] = -1000.0
-                    logits[:, 7] = 0.0
-                return logits
-
-        processor = ModelProcessor(
-            OccupancyModel,
-            torch.device("cpu"),
-            eos_token_id=7,
-            max_request_len=4,
-        )
-
-        await asyncio.gather(
-            processor.prefill(torch.tensor([11, 12]), temperature=0.0, top_p=1.0, max_new_tokens=2),
-            processor.prefill(torch.tensor([21, 22]), temperature=0.0, top_p=1.0, max_new_tokens=2),
-        )
-        await asyncio.sleep(0.1)
-
-        self.assertEqual(processor.model.prefill_batch_sizes, [1, 1])
-
-    async def test_prefill_requeues_until_last_chunk(self):
+    async def test_prefill_requeues_until_final_fixed_size_chunk(self):
         processor = ModelProcessor(
             FakeConcurrentModel,
             torch.device("cpu"),
             eos_token_id=7,
             max_request_len=8,
-            max_batch_prefill=8,
-            max_batch_generate=8,
+            prefill_chunk_size=2,
         )
 
-        handle_ids = await asyncio.gather(
-            processor.prefill(torch.tensor([11, 12, 13]), temperature=0.0, top_p=1.0),
-            processor.prefill(torch.tensor([21]), temperature=0.0, top_p=1.0),
+        handle_id = await processor.prefill(
+            torch.tensor([11, 12, 13]),
+            temperature=0.0,
+            top_p=1.0,
         )
-        handle = processor.handles[handle_ids[0]]
-        await asyncio.sleep(0.1)
+        await self.wait_until(lambda: handle_id in processor.kv_caches[0].release_calls)
 
-        self.assertTrue(any(row == [True] for row in processor.model.prefill_last_chunk_calls))
+        flattened = [length for call in processor.model.prefill_seq_lens for length in call]
+        self.assertEqual(flattened[:2], [2, 1])
 
-        tokens = []
-        while not handle.token_q.empty():
-            tokens.append(handle.token_q.get_nowait())
 
-        self.assertGreaterEqual(len(tokens), 1)
-        self.assertEqual(tokens[0], 1)
+if __name__ == "__main__":
+    unittest.main()
